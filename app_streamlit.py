@@ -28,7 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st.title("🔬 ePDFsuite - Interactive PDF Analysis")
+st.title("🔬 ePDFsuite - Interactive PDF Extraction")
 
 # Add CSS to style tab labels and reduce content font size
 st.markdown("""
