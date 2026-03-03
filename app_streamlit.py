@@ -184,7 +184,7 @@ with tab2:
     
     # ========== BEAMSTOP OPTION ==========
     st.markdown("### 🔍 Image Processing")
-    beamstop = st.checkbox("Beamstop present on sample images", value=True)
+    beamstop = st.checkbox("Find center from rings", value=True)
     
     # ========== OUTPUT PARAMETERS SECTION ==========
     st.markdown("## 📋 Input Parameters")
