@@ -28,7 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st.title("🔬 ePDFsuite - Interactive PDF Extraction")
+st.title("🔬 ePDFsuite - Interactive PDF Analysis")
 
 # Add CSS to style tab labels and reduce content font size
 st.markdown("""
@@ -262,7 +262,7 @@ with tab2:
                 I_array = []
                 q_array = []
                 for dm4_file_path in temp_files[:len(sample_images)]:
-                    proc_temp = SAEDProcessor(dm4_file_path, poni_file=poni_path, beamstop=beamstop, verbose=False)
+                    proc_temp = SAEDProcessor(dm4_file_path, poni_file=poni_path, beamstop=True, verbose=False)
                     q_temp, I_temp = proc_temp.integrate(dm4_file_path, plot=False)
                     q_array.append(q_temp)
                     I_array.append(I_temp)
@@ -296,7 +296,7 @@ with tab2:
                     try:
                         # Integrate reference image with beam center recalibration
                         # Using SAEDProcessor ensures consistent center recalibration
-                        proc_ref = SAEDProcessor(ref_path, poni_file=poni_path, beamstop=beamstop, verbose=False)
+                        proc_ref = SAEDProcessor(ref_path, poni_file=poni_path, beamstop=True, verbose=False)
                         q_ref, I_ref = proc_ref.integrate(ref_path, plot=False)
                         # Interpolate to sample q grid
                         st.session_state.I_ref = np.interp(st.session_state.q_data, q_ref, I_ref)
