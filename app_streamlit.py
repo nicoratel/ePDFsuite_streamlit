@@ -14,12 +14,18 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 
 # Import the necessary modules from your package
-from ePDFsuite import SAEDProcessor, extract_ePDF_from_mutliple_files
+from ePDFsuite import SAEDProcessor, extract_epdf
 from recalibration import recalibrate_with_beamstop_noponi
 from filereader import load_data
 from pdf_extraction import compute_ePDF
 from calibration import perform_geometric_calibration
 import hyperspy.api as hs
+
+# Initialize session state variables
+if 'sample_processor' not in st.session_state:
+    st.session_state.sample_processor = None
+if 'ref_processor' not in st.session_state:
+    st.session_state.ref_processor = None
 
 # Configure Streamlit page
 st.set_page_config(
@@ -28,7 +34,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st.title("🔬 ePDFsuite - Interactive PDF Analysis")
+st.title("🔬 ePDFsuite - Interactive PDF Extraction from SAED Images")
 
 # Add CSS to style tab labels and reduce content font size
 st.markdown("""
@@ -68,110 +74,212 @@ if st.sidebar.button("🛑 Stop App", type="secondary"):
     st.success("👋 Thanks for using ePDFsuite! Session ended.")
     st.stop()
 
-# Create three tabs
-# Create two tabs (Geometric Calibration tab removed - requires Qt which doesn't work with Streamlit)
-tab2, tab1 = st.tabs(["📈 PDF Extraction", "📸 Plot Data"])
+# Create two tabs (Define Sample/Ref first, then PDF Extraction)
+tab1, tab2 = st.tabs(["📸 Define Sample and Reference", "📈 Extract ePDF"])
 
 # ============================================================================
-# TAB 1: PLOT DATA (FORMERLY TAB 2)
+# TAB 1: DEFINE SAMPLE AND REFERENCE
 # ============================================================================
 with tab1:
-    st.markdown("# 📸 Sample Data Visualization")
-    st.markdown("**Visualize your sample diffraction image with the recalibrated beam center.**")
+    st.markdown("# 📸 Define Sample and Reference")
+    st.markdown("**Upload your diffraction images, inspect them, and define beam centers.**")
     
-    st.markdown("### 📁 Input Files")
+    # Create two columns for Sample and Reference
+    col_sample, col_ref = st.columns(2)
     
-    st.markdown("**Sample Image**")
-    sample_image_plot = st.file_uploader(
-        "Select sample image",
-        type=["dm4", "dm3", "tif", "tiff"],
-        key="sample_image_plot"
-    )
-    
-    if sample_image_plot is not None:
-        st.subheader("👁️ Sample Image with Recalibrated Center")
+    # ========== SAMPLE COLUMN ==========
+    with col_sample:
+        st.markdown("### 🔵 Sample")
         
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".dm4") as tmp_file:
-            tmp_file.write(sample_image_plot.getbuffer())
-            tmp_path = tmp_file.name
-        
-        try:
-            metadata, img = load_data(tmp_path, verbose=False)
-            
-            # Recalibrate center
-            center_x, center_y = recalibrate_with_beamstop_noponi(
-                img, threshold_rel=0.5, min_size=50, plot=False
-            )
-            
-            # Create matplotlib figure for sample image with beam center and LogNorm
-            fig, ax = plt.subplots(figsize=(5.5, 5.5))
-            im = ax.imshow(img / np.max(img), cmap='gray',
-                          norm=LogNorm(vmin=1e-4, vmax=1))
-            # Plot center marker
-            ax.plot(center_x, center_y, 'r+', markersize=15, markeredgewidth=2,
-                   label=f'Center: ({center_x:.1f}, {center_y:.1f})')
-            ax.set_title("Sample Image with Recalibrated Center")
-            ax.set_xlabel("X (pixels)")
-            ax.set_ylabel("Y (pixels)")
-            ax.legend(fontsize=11)
-            plt.colorbar(im, ax=ax, label="Intensity (normalized)")
-            st.pyplot(fig)
-            plt.close(fig)
-            
-            # Display metadata
-            with st.expander("📋 Image Metadata"):
-                st.json(metadata)
-        
-        except Exception as e:
-            st.error(f"Error loading image: {e}")
-        
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-    else:
-        st.info("📤 Please upload a sample image to visualize")
-
-# ============================================================================
-# TAB 2: PDF EXTRACTION (FORMERLY TAB 3)
-# ============================================================================
-with tab2:
-    st.markdown("# 📈 PDF Extraction")
-    st.markdown("**Calculate the Pair Distribution Function (PDF) from your sample and reference images. Adjust parameters with interactive sliders.**")
-    
-    # ========== FILE UPLOADS SECTION ==========
-    st.markdown("## 📁 Input Files")
-    
-    col_files1, col_files2 = st.columns(2)
-    
-    with col_files1:
-        st.markdown("**Sample Images** (multiple files allowed)")
-        sample_images = st.file_uploader(
-            "DM4, DM3, TIF, TIFF",
+        st.markdown("**Sample Image**")
+        sample_image = st.file_uploader(
+            "Upload sample diffraction image",
             type=["dm4", "dm3", "tif", "tiff"],
-            accept_multiple_files=True,
-            key="sample_images",
+            key="sample_image",
             label_visibility="collapsed"
         )
         
-        st.markdown("**PONI File** (optional)")
-        poni_file = st.file_uploader(
-            "Geometric calibration",
+        st.markdown("**PONI File**")
+        sample_poni = st.file_uploader(
+            "Upload sample PONI file (optional)",
             type=["poni"],
-            key="poni_file",
+            key="sample_poni",
             label_visibility="collapsed"
         )
+        
+        if sample_image is not None:
+            # Save to temp file and load
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".dm4") as tmp_file:
+                tmp_file.write(sample_image.getbuffer())
+                sample_tmp_path = tmp_file.name
+            
+            try:
+                metadata_sample, img_sample = load_data(sample_tmp_path, verbose=False)
+                
+                # Display image with Plotly (interactive coordinates)
+                img_normalized = np.log10(img_sample / np.max(img_sample) + 1e-4)
+                fig_sample = go.Figure(data=go.Heatmap(
+                    z=img_normalized,
+                    colorscale='Jet',
+                    hovertemplate='X: %{x}<br>Y: %{y}<br>Intensity: %{z:.2f}<extra></extra>',
+                    showscale=False,
+                ))
+                fig_sample.update_layout(
+                    title="Sample Image (hover to see coordinates)",
+                    xaxis_title="X (pixels)",
+                    yaxis_title="Y (pixels)",
+                    height=500,
+                    yaxis=dict(autorange='reversed', scaleanchor="x", scaleratio=1),  # Square aspect ratio
+                    xaxis=dict(constrain='domain'),
+                )
+                st.plotly_chart(fig_sample, use_container_width=True)
+                
+                # Center input
+                st.markdown("**Beam Center Coordinates**")
+                col_cx, col_cy = st.columns(2)
+                with col_cx:
+                    sample_center_x = st.number_input("Center X", value=img_sample.shape[1]//2, step=1, key="sample_cx")
+                with col_cy:
+                    sample_center_y = st.number_input("Center Y", value=img_sample.shape[0]//2, step=1, key="sample_cy")
+                
+                # Store paths in session state
+                st.session_state.sample_tmp_path = sample_tmp_path
+                st.session_state.sample_center = (sample_center_x, sample_center_y)
+                st.session_state.img_sample = img_sample
+                
+                # Handle PONI file
+                if sample_poni is not None:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".poni") as tmp_poni:
+                        tmp_poni.write(sample_poni.getbuffer())
+                        st.session_state.sample_poni_path = tmp_poni.name
+                else:
+                    st.session_state.sample_poni_path = None
+                
+            except Exception as e:
+                st.error(f"Error loading sample image: {e}")
+        else:
+            st.info("📤 Upload a sample image")
     
-    with col_files2:
-        st.markdown("**Reference Image** (optional)")
+    # ========== REFERENCE COLUMN ==========
+    with col_ref:
+        st.markdown("### 🟠 Reference (optional)")
+        
+        st.markdown("**Reference Image**")
         ref_image = st.file_uploader(
-            "DM4, DM3, TIF, TIFF",
+            "Upload reference diffraction image",
             type=["dm4", "dm3", "tif", "tiff"],
             key="ref_image",
             label_visibility="collapsed"
         )
+        
+        st.markdown("**PONI File**")
+        ref_poni = st.file_uploader(
+            "Upload ref PONI file (optional, defaults to sample PONI)",
+            type=["poni"],
+            key="ref_poni",
+            label_visibility="collapsed"
+        )
+        
+        if ref_image is not None:
+            # Save to temp file and load
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".dm4") as tmp_file:
+                tmp_file.write(ref_image.getbuffer())
+                ref_tmp_path = tmp_file.name
+            
+            try:
+                metadata_ref, img_ref = load_data(ref_tmp_path, verbose=False)
+                
+                # Display image with Plotly (interactive coordinates)
+                img_normalized = np.log10(img_ref / np.max(img_ref) + 1e-4)
+                fig_ref = go.Figure(data=go.Heatmap(
+                    z=img_normalized,
+                    colorscale='Jet',
+                    hovertemplate='X: %{x}<br>Y: %{y}<br>Intensity: %{z:.2f}<extra></extra>',
+                    showscale=False,
+                ))
+                fig_ref.update_layout(
+                    title="Reference Image (hover to see coordinates)",
+                    xaxis_title="X (pixels)",
+                    yaxis_title="Y (pixels)",
+                    height=500,
+                    yaxis=dict(autorange='reversed', scaleanchor="x", scaleratio=1),  # Square aspect ratio
+                    xaxis=dict(constrain='domain'),
+                )
+                st.plotly_chart(fig_ref, use_container_width=True)
+                
+                # Center input
+                st.markdown("**Beam Center Coordinates**")
+                col_cx, col_cy = st.columns(2)
+                with col_cx:
+                    ref_center_x = st.number_input("Center X", value=img_ref.shape[1]//2, step=1, key="ref_cx")
+                with col_cy:
+                    ref_center_y = st.number_input("Center Y", value=img_ref.shape[0]//2, step=1, key="ref_cy")
+                
+                # Store paths in session state
+                st.session_state.ref_tmp_path = ref_tmp_path
+                st.session_state.ref_center = (ref_center_x, ref_center_y)
+                st.session_state.img_ref = img_ref
+                
+                # Handle PONI file (default to sample PONI if not provided)
+                if ref_poni is not None:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".poni") as tmp_poni:
+                        tmp_poni.write(ref_poni.getbuffer())
+                        st.session_state.ref_poni_path = tmp_poni.name
+                else:
+                    st.session_state.ref_poni_path = st.session_state.get('sample_poni_path', None)
+                
+            except Exception as e:
+                st.error(f"Error loading reference image: {e}")
+        else:
+            st.info("📤 Upload a reference image (optional)")
+            st.session_state.ref_tmp_path = None
+    
+    # ========== VALIDATION BUTTON ==========
+    st.markdown("---")
+    if st.button("✅ Validate and Create Processors", type="primary"):
+        if sample_image is None:
+            st.error("❌ Please upload a sample image first")
+        else:
+            try:
+                # Create sample processor
+                st.session_state.sample_processor = SAEDProcessor(
+                    st.session_state.sample_tmp_path,
+                    poni_file=st.session_state.sample_poni_path,
+                    beamstop=True,
+                    verbose=False
+                )
+                st.session_state.sample_processor.initial_center = st.session_state.sample_center
+                
+                # Create reference processor if provided
+                if st.session_state.ref_tmp_path is not None:
+                    st.session_state.ref_processor = SAEDProcessor(
+                        st.session_state.ref_tmp_path,
+                        poni_file=st.session_state.ref_poni_path,
+                        beamstop=True,
+                        verbose=False
+                    )
+                    st.session_state.ref_processor.initial_center = st.session_state.ref_center
+                else:
+                    st.session_state.ref_processor = None
+                
+                st.success("✅ Processors created successfully! Go to 'Extract ePDF' tab.")
+                
+            except Exception as e:
+                st.error(f"❌ Error creating processors: {e}")
+                import traceback
+                st.error(traceback.format_exc())
 
-        #st.markdown("---")
-        st.info("💡 **PONI files** contain advanced geometric calibration data of the camera, taking into account camera rotations.\n They can be obtained using [perform_geometric_calibration](https://github.com/nicoratel/ePDFsuite/blob/main/Camera_Calibration_readME.md) function from ePDFsuite.calibration based on diffraction data of a polycrystalline standard specimen (e.g., Au, Si)...\n ")
+# ============================================================================
+# TAB 2: PDF EXTRACTION
+# ============================================================================
+with tab2:
+    st.markdown("# 📈 Extract ePDF")
+    st.markdown("**Calculate the Pair Distribution Function (PDF) from your processors. Adjust parameters with interactive sliders.**")
+    
+    # Check if processors are defined
+    if st.session_state.sample_processor is None:
+        st.warning("⚠️ Please define sample and reference in the 'Define Sample and Reference' tab first")
+        st.stop()
     
     # ========== DEFAULT VALUES ==========
     _default_bgscale = 1.0
@@ -182,11 +290,7 @@ with tab2:
     _default_lorch = True
     _default_composition = "Au"
     
-    # ========== BEAMSTOP OPTION ==========
-    st.markdown("### 🔍 Image Processing")
-    beamstop = st.checkbox("Find center from rings", value=True)
-    
-    # ========== OUTPUT PARAMETERS SECTION ==========
+    # ========== INPUT PARAMETERS SECTION ==========
     st.markdown("## 📋 Input Parameters")
     
     composition = st.text_input("Chemical composition", value=_default_composition, placeholder="e.g., Au, NaCl, Au3Cu")
@@ -216,109 +320,45 @@ with tab2:
     
     # Processing button
     if st.button("🚀 Calculate PDF", type="primary"):
-        if not sample_images:
-            st.error("❌ Please upload at least one sample image")
-        elif poni_file is None:
-            st.warning("⚠️ No PONI file provided - using automatic recalibration")
+        # Progress placeholder
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
-        # Save uploaded files temporarily
-        temp_files = []
         try:
-            for idx, sample_img in enumerate(sample_images):
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".dm4") as tmp:
-                    tmp.write(sample_img.getbuffer())
-                    temp_files.append(tmp.name)
-            
-            ref_path = None
-            if ref_image:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".dm4") as tmp:
-                    tmp.write(ref_image.getbuffer())
-                    ref_path = tmp.name
-                    temp_files.append(tmp.name)
-            
-            poni_path = None
-            if poni_file:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".poni") as tmp:
-                    tmp.write(poni_file.getbuffer())
-                    poni_path = tmp.name
-                    temp_files.append(tmp.name)
-            
-            # Progress placeholder
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            status_text.text("⏳ Integrating images...")
+            status_text.text("⏳ Integrating sample...")
             progress_bar.progress(25)
             
-            # Process with extract_ePDF_from_multiple_files
-            try:
-                # Create temporary output file
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".gr") as tmp_out:
-                    output_path = tmp_out.name
-                    temp_files.append(output_path)
-                
-                # First, integrate the sample images manually to get raw q and I
-                status_text.text("⏳ Integrating sample images...")
-                I_array = []
-                q_array = []
-                for dm4_file_path in temp_files[:len(sample_images)]:
-                    proc_temp = SAEDProcessor(dm4_file_path, poni_file=poni_path, beamstop=True, verbose=False)
-                    q_temp, I_temp = proc_temp.integrate(dm4_file_path, plot=False)
-                    q_array.append(q_temp)
-                    I_array.append(I_temp)
-                
-                # Use the q range from the first file as reference
-                q_raw = q_array[0]
-                
-                # Interpolate all I arrays to the same q grid
-                from scipy.interpolate import interp1d
-                I_interpolated = []
-                for i, I in enumerate(I_array):
-                    if len(I) != len(q_raw):
-                        f = interp1d(q_array[i], I, kind='linear', bounds_error=False, fill_value='extrapolate')
-                        I_interp = f(q_raw)
-                    else:
-                        I_interp = I
-                    I_interpolated.append(I_interp)
-                
-                I_raw = np.mean(I_interpolated, axis=0)  # Average of raw intensities
-                
-                # Store raw integration results in session state
-                st.session_state.q_data = q_raw
-                st.session_state.I_data = I_raw
-                st.session_state.composition = composition
-                st.session_state.rmin = rmin
-                st.session_state.rmax = rmax
-                st.session_state.rstep = rstep
-                
-                # Try to integrate reference image if available
-                if ref_path:
-                    try:
-                        # Integrate reference image with beam center recalibration
-                        # Using SAEDProcessor ensures consistent center recalibration
-                        proc_ref = SAEDProcessor(ref_path, poni_file=poni_path, beamstop=True, verbose=False)
-                        q_ref, I_ref = proc_ref.integrate(ref_path, plot=False)
-                        # Interpolate to sample q grid
-                        st.session_state.I_ref = np.interp(st.session_state.q_data, q_ref, I_ref)
-                    except Exception as e:
-                        st.warning(f"Could not integrate reference image: {e}")
-                        st.session_state.I_ref = None
-                else:
-                    st.session_state.I_ref = None
-                
-                progress_bar.progress(90)
-                st.session_state.data_ready = True
+            # Integrate sample
+            q_sample, I_sample = st.session_state.sample_processor.integrate(plot=False)
             
-            except Exception as e:
-                st.error(f"❌ Error during PDF calculation: {e}")
-                import traceback
-                st.error(traceback.format_exc())
-        
-        finally:
-            # Clean up temporary files
-            for tmp_file in temp_files:
-                if os.path.exists(tmp_file):
-                    os.remove(tmp_file)
+            status_text.text("⏳ Integrating reference...")
+            progress_bar.progress(50)
+            
+            # Integrate reference if available
+            if st.session_state.ref_processor is not None:
+                q_ref, I_ref = st.session_state.ref_processor.integrate(plot=False)
+                # Interpolate to sample q grid
+                I_ref_interp = np.interp(q_sample, q_ref, I_ref)
+            else:
+                I_ref_interp = None
+            
+            # Store data in session state for interactive controls
+            st.session_state.q_data = q_sample
+            st.session_state.I_data = I_sample
+            st.session_state.I_ref = I_ref_interp
+            st.session_state.composition = composition
+            st.session_state.rmin = rmin
+            st.session_state.rmax = rmax
+            st.session_state.rstep = rstep
+            
+            progress_bar.progress(100)
+            status_text.text("✅ Integration complete!")
+            st.session_state.data_ready = True
+            
+        except Exception as e:
+            st.error(f"❌ Error during integration: {e}")
+            import traceback
+            st.error(traceback.format_exc())
     
     # Display interactive controls if data is ready
     if hasattr(st.session_state, 'data_ready') and st.session_state.data_ready:
