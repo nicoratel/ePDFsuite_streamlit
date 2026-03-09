@@ -2,6 +2,7 @@ from filereader import load_data
 from recalibration import recalibrate_no_beamstop, recalibrate_with_beamstop, recalibrate_with_beamstop_noponi
 from pdf_extraction import compute_ePDF
 from pyFAI import load
+import fabio
 from matplotlib import pyplot as plt
 from matplotlib.colors import LogNorm
 import numpy as np
@@ -9,33 +10,44 @@ import hyperspy.api as hs
 
 
 class SAEDProcessor:
-    def __init__(self, dm4_file, poni_file = None,beamstop = True,verbose=False):
+    def __init__(self, image_file, poni_file = None, mask=None, verbose=False):
         """
         Initialize a SAED data processor.
         
         Parameters
         ----------
-        dm4_file : str
+        image_file : str
             SAED data file in DM4, DM3, tif, tiff format
         poni_file : str, optional
             Geometric calibration file in .poni format
-        beamstop : bool
-            Boolean indicating presence of beamstop on the image (affects recalibration method)
+        mask : str, optional
+            Mask file for the image
         verbose : bool
             If True, prints metadata information
         """
-        self.dm4_file = dm4_file
+        self.dm4_file = image_file
         self.poni_file = poni_file
-        self.beamstop = beamstop
+        self.beamstop = True
         self.initial_center = None  # To be set by user after inspection via plot()
-        metadata, img = load_data(dm4_file,verbose=verbose)
+        metadata, img = load_data(image_file,verbose=verbose)
         self.metadata = metadata
         self.img = img
+        if mask is not None:
+            mask_img = fabio.open(mask)
+            self.mask = mask_img.data
+        else:
+            self.mask = np.zeros_like(self.img)
+        
         if poni_file is not None:
             self.ai = load(poni_file)
             self.use_pyfai=True
+            if mask is not None:
+                mask_img = fabio.open(mask)
+                self.mask = mask_img.data.astype(bool)
+            else:
+                self.mask = np.zeros(self.img.shape, dtype=bool)
         else:
-            img = hs.load(dm4_file)
+            img = hs.load(image_file)
             self.use_pyfai=False
             self.scale = img.axes_manager[0].scale# in nm/pixel
             self.units = img.axes_manager[0].units
@@ -80,8 +92,8 @@ class SAEDProcessor:
             else: # recalibrate with beamstop correction
                 self.ai = recalibrate_no_beamstop(dm4_file, self.poni_file)
             
-            q, I = self.ai.integrate1d(img_data, npt, unit="q_A^-1", polarization_factor=0.99)
-
+            q, I = self.ai.integrate1d(img_data, npt, mask = self.mask, unit="q_A^-1", polarization_factor=0.99)
+            
         else: # intégration personnalisée sans pyFAI, pour les cas où il n'y a pas de fichier de calibration ou que les images ont des résolutions différentes
             # Charger l'image
             img = hs.load(dm4_file)

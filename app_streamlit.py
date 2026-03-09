@@ -107,6 +107,14 @@ with tab1:
             label_visibility="collapsed"
         )
         
+        st.markdown("**Mask File**")
+        sample_mask = st.file_uploader(
+            "Upload sample mask file (*.edf, optional)",
+            type=["edf"],
+            key="sample_mask",
+            label_visibility="collapsed"
+        )
+        
         if sample_image is not None:
             # Save to temp file and load
             with tempfile.NamedTemporaryFile(delete=False, suffix=".dm4") as tmp_file:
@@ -155,6 +163,14 @@ with tab1:
                 else:
                     st.session_state.sample_poni_path = None
                 
+                # Handle Mask file
+                if sample_mask is not None:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".edf") as tmp_mask:
+                        tmp_mask.write(sample_mask.getbuffer())
+                        st.session_state.sample_mask_path = tmp_mask.name
+                else:
+                    st.session_state.sample_mask_path = None
+                
             except Exception as e:
                 st.error(f"Error loading sample image: {e}")
         else:
@@ -179,6 +195,22 @@ with tab1:
             key="ref_poni",
             label_visibility="collapsed"
         )
+        if ref_poni is None and sample_poni is not None:
+            st.caption(f"ℹ️ Using sample PONI: {sample_poni.name}")
+        elif ref_poni is not None:
+            st.caption(f"✅ Using: {ref_poni.name}")
+        
+        st.markdown("**Mask File**")
+        ref_mask = st.file_uploader(
+            "Upload ref mask file (*.edf, optional)",
+            type=["edf"],
+            key="ref_mask",
+            label_visibility="collapsed"
+        )
+        if ref_mask is None and sample_mask is not None:
+            st.caption(f"ℹ️ Using sample mask: {sample_mask.name}")
+        elif ref_mask is not None:
+            st.caption(f"✅ Using: {ref_mask.name}")
         
         if ref_image is not None:
             # Save to temp file and load
@@ -228,6 +260,14 @@ with tab1:
                 else:
                     st.session_state.ref_poni_path = st.session_state.get('sample_poni_path', None)
                 
+                # Handle Mask file (default to sample mask if not provided)
+                if ref_mask is not None:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".edf") as tmp_mask:
+                        tmp_mask.write(ref_mask.getbuffer())
+                        st.session_state.ref_mask_path = tmp_mask.name
+                else:
+                    st.session_state.ref_mask_path = st.session_state.get('sample_mask_path', None)
+                
             except Exception as e:
                 st.error(f"Error loading reference image: {e}")
         else:
@@ -245,7 +285,7 @@ with tab1:
                 st.session_state.sample_processor = SAEDProcessor(
                     st.session_state.sample_tmp_path,
                     poni_file=st.session_state.sample_poni_path,
-                    beamstop=True,
+                    mask=st.session_state.get('sample_mask_path', None),
                     verbose=False
                 )
                 st.session_state.sample_processor.initial_center = st.session_state.sample_center
@@ -255,7 +295,7 @@ with tab1:
                     st.session_state.ref_processor = SAEDProcessor(
                         st.session_state.ref_tmp_path,
                         poni_file=st.session_state.ref_poni_path,
-                        beamstop=True,
+                        mask=st.session_state.get('ref_mask_path', None),
                         verbose=False
                     )
                     st.session_state.ref_processor.initial_center = st.session_state.ref_center
@@ -377,8 +417,8 @@ with tab2:
             bgscale_int = st.slider("bgscale", 0.0, 2.5, _default_bgscale, 0.01, key="bgscale_slider")
             qmin_int = st.slider("qmin (Å⁻¹)", 0.1, q_max_data, _default_qmin, 0.1, key="qmin_slider")
             qmax_int = st.slider("qmax (Å⁻¹)", float(np.min(st.session_state.q_data)), q_max_data, _default_qmax, 0.1, key="qmax_slider")
-            rpoly_int = st.slider("rpoly", 0.1, 10.0, _default_rpoly, 0.1, key="rpoly_slider")
             qmaxinst_int = st.slider("qmaxinst (Å⁻¹)", float(np.min(st.session_state.q_data)), q_max_data, _default_qmaxinst, 0.1, key="qmaxinst_slider")
+            rpoly_int = st.slider("rpoly", 0.1, 10.0, _default_rpoly, 0.1, key="rpoly_slider")
             lorch_int = st.checkbox("Lorch window correction", value=_default_lorch, key="lorch_checkbox")
             
             st.markdown("---")
