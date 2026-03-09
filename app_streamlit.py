@@ -99,7 +99,7 @@ with tab1:
             label_visibility="collapsed"
         )
         
-        st.markdown("**PONI File**")
+        st.markdown("**PONI File (optional)**")
         sample_poni = st.file_uploader(
             "Upload sample PONI file (optional)",
             type=["poni"],
@@ -107,7 +107,7 @@ with tab1:
             label_visibility="collapsed"
         )
         
-        st.markdown("**Mask File**")
+        st.markdown("**Mask File (optional)**")
         sample_mask = st.file_uploader(
             "Upload sample mask file (*.edf, optional)",
             type=["edf"],
@@ -188,7 +188,7 @@ with tab1:
             label_visibility="collapsed"
         )
         
-        st.markdown("**PONI File**")
+        st.markdown("**PONI File (optional)**")
         ref_poni = st.file_uploader(
             "Upload ref PONI file (optional, defaults to sample PONI)",
             type=["poni"],
@@ -200,7 +200,7 @@ with tab1:
         elif ref_poni is not None:
             st.caption(f"✅ Using: {ref_poni.name}")
         
-        st.markdown("**Mask File**")
+        st.markdown("**Mask File (optional)**")
         ref_mask = st.file_uploader(
             "Upload ref mask file (*.edf, optional)",
             type=["edf"],
