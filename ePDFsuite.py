@@ -1,6 +1,6 @@
-from .filereader import load_data
-from .recalibration import recalibrate_no_beamstop, recalibrate_with_beamstop, recalibrate_with_beamstop_noponi
-from .pdf_extraction import compute_ePDF
+from filereader import load_data
+from recalibration import recalibrate_no_beamstop, recalibrate_with_beamstop, recalibrate_with_beamstop_noponi
+from pdf_extraction import compute_ePDF
 from pyFAI import load
 import fabio
 from matplotlib import pyplot as plt
