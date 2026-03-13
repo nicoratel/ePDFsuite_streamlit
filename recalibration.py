@@ -3,7 +3,7 @@ from skimage import filters, measure, morphology
 from skimage.transform import hough_ellipse
 from skimage.feature import canny
 from pyFAI import load
-from .filereader import load_data
+from filereader import load_data
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 
