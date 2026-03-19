@@ -18,7 +18,7 @@ from ePDFsuite import SAEDProcessor, extract_epdf
 from recalibration import recalibrate_with_beamstop_noponi
 from filereader import load_data
 from pdf_extraction import compute_ePDF
-from calibration import perform_geometric_calibration
+#from calibration import perform_geometric_calibration
 import hyperspy.api as hs
 
 # Initialize session state variables
