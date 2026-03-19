@@ -34,7 +34,7 @@ setup(
     include_package_data=True,
     keywords="SAED electron diffraction PDF RDF distribution function",
     project_urls={
-        "Documentation": "https://github.com/nicoratel/ePDFsuite/wiki",
+        "Documentation": "https://github.com/nicoratel/ePDFsuite/docs",
         "Source": "https://github.com/nicoratel/ePDFsuite",
         "Tracker": "https://github.com/nicoratel/ePDFsuite/issues",
     },
