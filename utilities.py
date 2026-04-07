@@ -1,592 +1,949 @@
-"""
-TEM Diffraction Pattern Intensity Correction Functions
-
-This module provides comprehensive functions for correcting intensity artifacts
-in transmission electron microscopy (TEM) diffraction patterns, including
-flat-field correction, MTF deconvolution, and geometric distortion correction.
-
-Author: Assistant
-Date: 2026-01-15
-"""
-
+from scipy.ndimage import gaussian_filter1d
+from scipy.optimize import curve_fit
+from scipy.special import erf
 import numpy as np
-import hyperspy.api as hs
-from scipy.ndimage import median_filter, geometric_transform
-from scipy import signal
-from typing import Optional, Tuple, Union
+from matplotlib import pyplot as plt
+from filereader import load_data
+from scipy.ndimage import rotate, binary_erosion
+from skimage.transform import hough_line, hough_line_peaks
+from skimage.feature import canny
+import fabio
+import os
+import sys
+import shutil
 
 
-def apply_mtf_correction(
-    signal: hs.signals.Signal2D,
-    mtf_curve: np.ndarray,
-    frequencies: np.ndarray,
-    min_mtf_threshold: float = 0.1
-) -> hs.signals.Signal2D:
+def draw_mask(dm4_image):
+    # load data and metadata
+    detector_info, raw_image = load_data(dm4_image)
+
+    # Define output EDF file name
+    edffile = dm4_image.replace('.dm4', '.edf')
+
+    # Create EDF image and save
+    edf_image = fabio.edfimage.EdfImage(data=raw_image, header=detector_info)
+    edf_image.write(edffile)
+    # edit command to use the same python executable as the current environment (important for pyFAI-drawmask to find the right fabio installation)
+    path = shutil.which("pyFAI-drawmask")
+    os.system(f'"{sys.executable}" {path} {edffile}')
+    os.remove(edffile)
+
+def detect_edge_angle_hough(edge_data, sigma=1, erosion_px=10,
+                            num_peaks=5, plot=False):
     """
-    Apply MTF (Modulation Transfer Function) correction to a diffraction pattern.
-    
-    This function corrects for the detector's MTF by performing deconvolution
-    in Fourier space. The MTF describes how the detector attenuates different
-    spatial frequencies.
-    
+    Edge angle detection using the standard Hough transform.
+
     Parameters
     ----------
-    signal : hyperspy.signals.Signal2D
-        Input diffraction pattern to be corrected. Must have calibrated axes.
-    mtf_curve : np.ndarray
-        1D array containing MTF values as a function of spatial frequency.
-        Values should range from 0 to 1, with 1 representing perfect transfer.
-    frequencies : np.ndarray
-        1D array of spatial frequencies corresponding to mtf_curve values.
-        Units should match the reciprocal of signal's spatial calibration.
-    min_mtf_threshold : float, optional
-        Minimum MTF value to prevent division by zero and over-amplification
-        of high-frequency noise. Values below this are clipped. Default is 0.1.
-    
-    Returns
-    -------
-    hyperspy.signals.Signal2D
-        MTF-corrected diffraction pattern with same shape and calibration
-        as input signal.
-    
-    Notes
-    -----
-    The correction is performed by:
-    1. Computing the 2D FFT of the input image
-    2. Creating a 2D MTF map by interpolating the 1D MTF curve radially
-    3. Dividing the FFT by the MTF (deconvolution in Fourier space)
-    4. Computing the inverse FFT to return to real space
-    
-    The min_mtf_threshold prevents numerical instability and excessive noise
-    amplification at high spatial frequencies where MTF approaches zero.
-    
-    Examples
-    --------
-    >>> import hyperspy.api as hs
-    >>> import numpy as np
-    >>> 
-    >>> # Load diffraction pattern
-    >>> dp = hs.load("diffraction.dm3")
-    >>> 
-    >>> # Define measured MTF
-    >>> freqs = np.linspace(0, 1.0, 100)  # Normalized frequency
-    >>> mtf = np.exp(-2 * freqs)  # Example Gaussian MTF
-    >>> 
-    >>> # Apply correction
-    >>> dp_corrected = apply_mtf_correction(dp, mtf, freqs)
-    
-    References
-    ----------
-    .. [1] Meyer, R. R., & Kirkland, A. I. (2000). The effects of electron 
-           and photon scattering on signal and noise transfer properties of 
-           scintillators in CCD cameras used for electron detection.
+    edge_data   : masked 2D image
+    sigma       : smoothing parameter for Canny edge detection (1–2 for quasi-binary images)
+    erosion_px  : numbers of pixels to crop from the edges of the NaN mask (to avoid artefacts)
+    num_peaks   : number of peaks to extract from the Hough accumulator (default=5)
+    plot        : whether to display debug plots (default=False)
     """
-    # Compute FFT of the image
-    fft_image = np.fft.fft2(signal.data)
-    fft_shifted = np.fft.fftshift(fft_image)
-    
-    # Create frequency grids
-    ny, nx = signal.data.shape
-    freq_y = np.fft.fftfreq(ny, d=signal.axes_manager[0].scale)
-    freq_x = np.fft.fftfreq(nx, d=signal.axes_manager[1].scale)
-    freq_y_shifted = np.fft.fftshift(freq_y)
-    freq_x_shifted = np.fft.fftshift(freq_x)
-    
-    # Create 2D radial frequency grid
-    FX, FY = np.meshgrid(freq_x_shifted, freq_y_shifted)
-    freq_radial = np.sqrt(FX**2 + FY**2)
-    
-    # Interpolate MTF curve onto 2D grid
-    mtf_2d = np.interp(freq_radial, frequencies, mtf_curve)
-    
-    # Apply threshold to prevent division by zero and over-amplification
-    mtf_2d[mtf_2d < min_mtf_threshold] = min_mtf_threshold
-    
-    # Perform deconvolution (division in Fourier space)
-    fft_corrected = fft_shifted / mtf_2d
-    
-    # Transform back to real space
-    fft_unshifted = np.fft.ifftshift(fft_corrected)
-    corrected_data = np.fft.ifft2(fft_unshifted).real
-    
-    # Create output signal with same metadata
-    corrected = signal.deepcopy()
-    corrected.data = corrected_data
-    
-    return corrected
+    arr = edge_data.astype(float)
+    valid = ~np.isnan(arr)
 
+    # Normalise to [0, 1]
+    vmin, vmax = np.nanmin(arr), np.nanmax(arr)
+    arr_norm = (arr - vmin) / (vmax - vmin + 1e-12)
 
-def wiener_deconvolution(
-    signal: hs.signals.Signal2D,
-    mtf_curve: np.ndarray,
-    frequencies: np.ndarray,
-    noise_variance: Optional[float] = None,
-    corner_size: int = 10
-) -> hs.signals.Signal2D:
-    """
-    Apply Wiener deconvolution for optimal MTF correction with noise suppression.
-    
-    Wiener deconvolution provides optimal linear filtering in the presence of
-    noise by balancing MTF correction against noise amplification. This is
-    particularly useful for detector correction when signal-to-noise ratio
-    varies across spatial frequencies.
-    
-    Parameters
-    ----------
-    signal : hyperspy.signals.Signal2D
-        Input diffraction pattern to be corrected.
-    mtf_curve : np.ndarray
-        1D array of MTF values as function of spatial frequency.
-    frequencies : np.ndarray
-        1D array of spatial frequencies corresponding to mtf_curve.
-    noise_variance : float, optional
-        Variance of the noise in the image. If None, it will be estimated
-        from the corner regions of the image. Default is None.
-    corner_size : int, optional
-        Size (in pixels) of corner regions used for noise estimation when
-        noise_variance is None. Default is 10.
-    
-    Returns
-    -------
-    hyperspy.signals.Signal2D
-        Wiener-filtered diffraction pattern.
-    
-    Notes
-    -----
-    The Wiener filter is given by:
-    
-    .. math::
-        W(f) = \\frac{H^*(f)}{|H(f)|^2 + 1/SNR(f)}
-    
-    where H(f) is the MTF, H* is its complex conjugate, and SNR is the
-    signal-to-noise ratio at frequency f.
-    
-    This approach provides better results than simple MTF division when
-    dealing with noisy data, as it automatically reduces correction strength
-    at frequencies where noise dominates.
-    
-    Examples
-    --------
-    >>> # Apply Wiener deconvolution with automatic noise estimation
-    >>> dp_wiener = wiener_deconvolution(dp, mtf, freqs)
-    >>> 
-    >>> # Or specify known noise variance
-    >>> dp_wiener = wiener_deconvolution(dp, mtf, freqs, noise_variance=0.05)
-    
-    References
-    ----------
-    .. [1] Wiener, N. (1949). Extrapolation, Interpolation, and Smoothing 
-           of Stationary Time Series. MIT Press.
-    """
-    # Compute FFT
-    fft_image = np.fft.fft2(signal.data)
-    fft_shifted = np.fft.fftshift(fft_image)
-    
-    # Create 2D MTF map
-    ny, nx = signal.data.shape
-    freq_y = np.fft.fftfreq(ny, d=signal.axes_manager[0].scale)
-    freq_x = np.fft.fftfreq(nx, d=signal.axes_manager[1].scale)
-    FX, FY = np.meshgrid(np.fft.fftshift(freq_x), 
-                          np.fft.fftshift(freq_y))
-    freq_radial = np.sqrt(FX**2 + FY**2)
-    mtf_2d = np.interp(freq_radial, frequencies, mtf_curve)
-    
-    # Estimate noise variance if not provided
-    if noise_variance is None:
-        # Use corner regions (typically background)
-        corners = np.concatenate([
-            signal.data[:corner_size, :corner_size].flatten(),
-            signal.data[-corner_size:, :corner_size].flatten(),
-            signal.data[:corner_size, -corner_size:].flatten(),
-            signal.data[-corner_size:, -corner_size:].flatten()
-        ])
-        noise_variance = np.var(corners)
-    
-    # Compute signal power and SNR
-    signal_power = np.abs(fft_shifted)**2
-    snr = signal_power / noise_variance
-    
-    # Wiener filter: H* / (|H|^2 + SNR^-1)
-    wiener_filter = np.conj(mtf_2d) / (np.abs(mtf_2d)**2 + 1.0 / (snr + 1e-10))
-    
-    # Apply filter
-    fft_corrected = fft_shifted * wiener_filter
-    
-    # Transform back to real space
-    corrected_data = np.fft.ifft2(np.fft.ifftshift(fft_corrected)).real
-    
-    # Create output signal
-    corrected = signal.deepcopy()
-    corrected.data = corrected_data
-    
-    return corrected
+    # Erosion: remove border pixels of the NaN mask
+    valid_eroded = binary_erosion(valid, iterations=erosion_px)
 
+    # Apply mask: pixels outside eroded region → 0
+    arr_masked = np.where(valid_eroded, arr_norm, 0.0)
 
-def complete_diffraction_correction(
-    dp_raw: hs.signals.Signal2D,
-    dark_ref: hs.signals.Signal2D = None,
-    flat_ref: hs.signals.Signal2D = None,
-    mtf_curve: Optional[np.ndarray] = None,
-    mtf_frequencies: Optional[np.ndarray] = None,
-    correct_bad_pixels: bool = True,
-    bad_pixel_threshold: Tuple[float, float] = (0.5, 1.5)
-) -> hs.signals.Signal2D:
-    """
-    Complete intensity correction pipeline for diffraction patterns.
-    
-    This function applies a comprehensive series of corrections to raw
-    diffraction patterns, including dark current subtraction, flat-field
-    correction, bad pixel correction, and optional MTF deconvolution.
-    
-    Parameters
-    ----------
-    dp_raw : hyperspy.signals.Signal2D
-        Raw, uncorrected diffraction pattern.
-    dark_ref : hyperspy.signals.Signal2D
-        Dark reference image (acquired with no beam), same shape as dp_raw.
-    flat_ref : hyperspy.signals.Signal2D
-        Flat-field reference image (uniform illumination), same shape as dp_raw.
-    mtf_curve : np.ndarray, optional
-        1D array of MTF values for detector correction. If None, MTF
-        correction is skipped. Default is None.
-    mtf_frequencies : np.ndarray, optional
-        1D array of frequencies corresponding to mtf_curve. Required if
-        mtf_curve is provided. Default is None.
-    correct_bad_pixels : bool, optional
-        Whether to perform bad pixel correction. Default is True.
-    bad_pixel_threshold : tuple of float, optional
-        (lower, upper) threshold for flat-field normalized values to identify
-        bad pixels. Pixels outside this range are interpolated. Default is (0.5, 1.5).
-    
-    Returns
-    -------
-    hyperspy.signals.Signal2D
-        Fully corrected diffraction pattern.
-    
-    Notes
-    -----
-    The correction pipeline follows these steps:
-    
-    1. **Dark current subtraction**: Removes detector thermal noise
+    # Canny edge detection (normalised, masked image)
+    # low_threshold / high_threshold: adjust to SNR
+    edge_map = canny(arr_masked, sigma=sigma,
+                     low_threshold=0.1, high_threshold=0.3,
+                     mask=valid_eroded)
+
        
-       .. math:: I_1 = I_{raw} - I_{dark}
-    
-    2. **Flat-field correction**: Corrects for non-uniform detector response
-       
-       .. math:: I_2 = I_1 / (I_{flat} / \\langle I_{flat} \\rangle)
-    
-    3. **Bad pixel correction**: Interpolates defective pixels using median filter
-    
-    4. **MTF deconvolution** (optional): Corrects for detector blur
-    
-    5. **Normalization**: Shifts minimum to zero
-    
-    Examples
-    --------
-    >>> # Acquire reference images
-    >>> dark = hs.load("dark_ref.dm3")
-    >>> flat = hs.load("flat_ref.dm3")
-    >>> 
-    >>> # Load diffraction pattern
-    >>> dp_raw = hs.load("diffraction_raw.dm3")
-    >>> 
-    >>> # Apply full correction pipeline
-    >>> dp_corrected = complete_diffraction_correction(
-    ...     dp_raw, dark, flat,
-    ...     mtf_curve=mtf_measured,
-    ...     mtf_frequencies=freq_array
-    ... )
-    >>> 
-    >>> # Without MTF correction
-    >>> dp_corrected = complete_diffraction_correction(dp_raw, dark, flat)
-    
-    See Also
-    --------
-    apply_mtf_correction : MTF deconvolution function
-    wiener_deconvolution : Alternative MTF correction with noise handling
-    """
-    # Step 1: Dark current subtraction
-    if dark_ref is not None:
-        dp = dp_raw - dark_ref
-    else:
-        dp = dp_raw
-    # Step 2: Flat-field correction
-    if flat_ref is not None:
-        flat_norm = flat_ref / flat_ref.mean()
-        dp = dp / flat_norm
-    else:
-        dp = dp_raw
-    
-    # Step 3: Bad pixel correction
-    if correct_bad_pixels:
-        low_thresh, high_thresh = bad_pixel_threshold
-        bad_pixels = (flat_norm.data < low_thresh) | (flat_norm.data > high_thresh)
-        
-        dp_clean = dp.deepcopy()
-        
-        # Interpolate bad pixels using median of neighborhood
-        for i in range(dp.data.shape[0]):
-            for j in range(dp.data.shape[1]):
-                if bad_pixels[i, j]:
-                    # Extract 3x3 neighborhood
-                    i_min, i_max = max(0, i-1), min(dp.data.shape[0], i+2)
-                    j_min, j_max = max(0, j-1), min(dp.data.shape[1], j+2)
-                    neighborhood = dp.data[i_min:i_max, j_min:j_max]
-                    
-                    # Replace with median (excluding the bad pixel itself)
-                    dp_clean.data[i, j] = np.median(neighborhood)
-    else:
-        dp_clean = dp
-    
-    # Step 4: MTF correction (if provided)
-    if mtf_curve is not None and mtf_frequencies is not None:
-        dp_clean = apply_mtf_correction(
-            dp_clean,
-            mtf_curve,
-            mtf_frequencies
-        )
-    
-    # Step 5: Final normalization
-    dp_clean = dp_clean - dp_clean.min()
-    
-    return dp_clean
 
+    # Standard Hough transform
+    # tested_angles: angular resolution — 3600 pts = 0.05° precision
+    tested_angles = np.linspace(-np.pi / 2, np.pi / 2, 3600, endpoint=False)
+    h, theta, d = hough_line(edge_map, theta=tested_angles)
 
-def ellipse_correction(
-    image: np.ndarray,
-    ratio: float = 1.05,
-    angle: float = 0.0,
-    order: int = 3
-) -> np.ndarray:
-    """
-    Correct elliptical distortion in diffraction patterns.
-    
-    Many detectors and projection systems introduce slight elliptical distortion
-    where circular features appear as ellipses. This function corrects such
-    distortion by applying an inverse elliptical transformation.
-    
-    Parameters
-    ----------
-    image : np.ndarray
-        Input 2D image array to be corrected.
-    ratio : float, optional
-        Ratio of ellipse major to minor axis (aspect ratio correction factor).
-        Values > 1 compress the major axis, < 1 expand it. Default is 1.05.
-    angle : float, optional
-        Orientation angle of the ellipse major axis in radians.
-        0 corresponds to horizontal, π/2 to vertical. Default is 0.0.
-    order : int, optional
-        Interpolation order (0-5). Higher values give smoother results but
-        are slower. 3 (cubic) is a good balance. Default is 3.
-    
-    Returns
-    -------
-    np.ndarray
-        Corrected image with same shape as input.
-    
-    Notes
-    -----
-    The correction transforms coordinates according to:
-    
-    1. Translate to image center
-    2. Rotate by -angle
-    3. Scale x-coordinates by 1/ratio
-    4. Rotate by +angle
-    5. Translate back
-    
-    This effectively applies the inverse of the elliptical distortion.
-    
-    Examples
-    --------
-    >>> import numpy as np
-    >>> 
-    >>> # Load diffraction pattern
-    >>> dp = hs.load("diffraction.dm3")
-    >>> 
-    >>> # Correct 5% elliptical distortion along horizontal axis
-    >>> corrected = ellipse_correction(dp.data, ratio=1.05, angle=0)
-    >>> 
-    >>> # Correct ellipse oriented at 30 degrees
-    >>> corrected = ellipse_correction(
-    ...     dp.data, 
-    ...     ratio=1.08, 
-    ...     angle=np.pi/6
-    ... )
-    
-    See Also
-    --------
-    scipy.ndimage.geometric_transform : Underlying transformation function
-    """
-    def transform_func(output_coords):
-        """
-        Coordinate transformation function for geometric_transform.
-        
-        Maps output coordinates to input coordinates using inverse
-        elliptical transformation.
-        """
-        x, y = output_coords
-        
-        # Image center
-        cx, cy = image.shape[0] / 2, image.shape[1] / 2
-        
-        # Translate to center
-        x_rel, y_rel = x - cx, y - cy
-        
-        # Inverse rotation
-        cos_a, sin_a = np.cos(-angle), np.sin(-angle)
-        x_rot = x_rel * cos_a - y_rel * sin_a
-        y_rot = x_rel * sin_a + y_rel * cos_a
-        
-        # Inverse ellipse correction (scale x-axis)
-        x_corr = x_rot / ratio
-        y_corr = y_rot
-        
-        # Forward rotation
-        cos_a, sin_a = np.cos(angle), np.sin(angle)
-        x_final = x_corr * cos_a - y_corr * sin_a + cx
-        y_final = x_corr * sin_a + y_corr * cos_a + cy
-        
-        return x_final, y_final
-    
-    # Apply geometric transformation
-    corrected = geometric_transform(
-        image,
-        transform_func,
-        order=order,
-        mode='constant',
-        cval=0.0
+    # Extract peaks
+    _, peak_angles, peak_dists = hough_line_peaks(
+        h, theta, d,
+        num_peaks=num_peaks,
+        threshold=0.3 * h.max()   # ignore weak peaks
     )
-    
-    return corrected
 
+    if len(peak_angles) == 0:
+        print("[WARN] No Hough peak detected.")
+        return 0.0, 0.0, None, None
 
-def compare_corrections(
-    dp_before: hs.signals.Signal2D,
-    dp_after: hs.signals.Signal2D,
-    save_figure: Optional[str] = None
-) -> dict:
+    theta = peak_angles[0]   # normal to the line
+    rho   = peak_dists[0]    # signed distance from origin to line
+
+    # Line angle (convention: angle w.r.t. horizontal)
+    line_angle_rad = theta + np.pi / 2
+    line_angle_rad = (line_angle_rad + np.pi / 2) % np.pi - np.pi / 2
+    line_angle_deg = np.degrees(line_angle_rad)
+
+    # ----------------------------------------------------------------
+    # Geometric reconstruction of the line from (theta, rho)
+    # Equation: x*cos(theta) + y*sin(theta) = rho
+    # ----------------------------------------------------------------
+    ny, nx = edge_data.shape
+    x0_img = nx / 2.0   # image centre (origin of Hough frame if skimage
+    y0_img = ny / 2.0   # native frame is used, i.e. corner (0,0))
+
+    # Point on the line at y = image centre
+    # → solve: x*cos(theta) + y_mid*sin(theta) = rho
+    y_mid = ny / 2.0
+    if np.abs(np.cos(theta)) > 1e-6:
+        x_at_ymid = (rho - y_mid * np.sin(theta)) / np.cos(theta)
+    else:
+        x_at_ymid = rho / (np.cos(theta) + 1e-12)   # near-horizontal line
+
+    # Point on the line at x = image centre
+    x_mid = nx / 2.0
+    if np.abs(np.sin(theta)) > 1e-6:
+        y_at_xmid = (rho - x_mid * np.cos(theta)) / np.sin(theta)
+    else:
+        y_at_xmid = rho / (np.sin(theta) + 1e-12)
+
+    # Returned parameters summary
+    edge_point = (x_at_ymid, y_mid)          # a point on the line
+    edge_line  = (theta, rho, line_angle_deg) # (normal, distance, line angle in °)
+
+    if plot:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        # Masked image
+        axes[0].imshow(arr_masked, cmap='gray')
+        axes[0].set_title(f'Masked image (erosion {erosion_px}px)')
+
+        # Canny edge map
+        axes[1].imshow(edge_map, cmap='gray')
+        axes[1].set_title(f'Canny edges ({edge_map.sum()} px)')
+
+        # Hough accumulator
+        axes[2].imshow(
+            np.log(1 + h),
+            extent=[np.degrees(theta[0]), np.degrees(theta[-1]),
+                    d[-1], d[0]],
+            aspect='auto', cmap='hot'
+        )
+        axes[2].set_xlabel('θ (degrees)')
+        axes[2].set_ylabel('ρ (pixels)')
+        axes[2].set_title('Hough accumulator (log)')
+        # Mark peaks
+        for a, dist in zip(peak_angles, peak_dists):
+            axes[2].plot(np.degrees(a), dist, 'c+', ms=10, mew=2)
+
+        # Overlay detected line on image
+        axes[1].set_title(f'Canny + detected edge ({line_angle_deg:.2f}°)')
+        h_img, w_img = edge_map.shape
+        angle = peak_angles[0]
+        rho = peak_dists[0]
+        if np.abs(np.sin(angle)) > 1e-6:
+            x_vals = np.array([0, w_img])
+            y_vals = (rho - x_vals * np.cos(angle)) / np.sin(angle)
+        else:
+            x_vals = np.array([rho, rho])
+            y_vals = np.array([0, h_img])
+        axes[1].plot(x_vals, y_vals, 'r-', lw=2,
+                     label=f'{line_angle_deg:.2f}°')
+        axes[1].legend()
+
+        plt.tight_layout()
+        plt.show()
+
+    return line_angle_rad, line_angle_deg, edge_point, edge_line
+
+def compute_mtf_slanted_edge(image_path,
+                             mask=None,
+                             pixel_size=None,
+                             binning_factor=1,
+                             roi_half_width=15,
+                             nbins=500,
+                             smooth_sigma=0.5,
+                             use_erf_fit=True,
+                             plot=True,
+                             outputfile=None):
     """
-    Compare diffraction patterns before and after correction with visualization.
-    
-    This function generates a comprehensive comparison showing images,
-    histograms, and radial profiles before and after correction, along
-    with quantitative metrics.
-    
+    Compute the MTF using the slanted-edge method, with automatic edge
+    angle and position detection via Hough transform.
+
     Parameters
     ----------
-    dp_before : hyperspy.signals.Signal2D
-        Diffraction pattern before correction.
-    dp_after : hyperspy.signals.Signal2D
-        Diffraction pattern after correction.
-    save_figure : str, optional
-        If provided, save the comparison figure to this filepath.
-        Default is None (display only).
-    
+    image_path     : str   - Path to the image file.
+    mask           : str   - Path to a fabio mask file (0=valid, 1=masked).
+    pixel_size     : float - Pixel size in µm.
+    binning_factor : int   - Binning factor applied to the detector (default 1).
+    roi_half_width : int   - Half-width of the band around the edge (pixels).
+    nbins          : int   - Number of sub-pixel bins for the ESF.
+    smooth_sigma   : float - Sigma of the Gaussian smoothing applied to the ESF.
+    use_erf_fit    : bool  - Fit the ESF with an error function before differentiation.
+    plot           : bool  - Display diagnostic plots.
+    outputfile     : str   - If provided, save the MTF to this text file.
+
     Returns
     -------
-    dict
-        Dictionary containing comparison metrics:
-        - 'snr_before': Signal-to-noise ratio before correction
-        - 'snr_after': Signal-to-noise ratio after correction
-        - 'mean_before': Mean intensity before correction
-        - 'mean_after': Mean intensity after correction
-        - 'std_before': Standard deviation before correction
-        - 'std_after': Standard deviation after correction
-    
-    Notes
-    -----
-    Signal-to-noise ratio (SNR) is calculated as mean/std, which provides
-    a simple quality metric. Higher SNR generally indicates better quality,
-    though interpretation depends on the specific imaging conditions.
-    
-    Examples
-    --------
-    >>> # Compare before and after correction
-    >>> metrics = compare_corrections(dp_raw, dp_corrected)
-    >>> print(f"SNR improvement: {metrics['snr_after']/metrics['snr_before']:.2f}x")
-    >>> 
-    >>> # Save comparison figure
-    >>> compare_corrections(
-    ...     dp_raw, 
-    ...     dp_corrected, 
-    ...     save_figure='correction_comparison.png'
-    ... )
+    freq_pixel : 1D array - Spatial frequencies (cycles/pixel)
+    mtf        : 1D array - Corresponding MTF values
     """
-    import matplotlib.pyplot as plt
+    # ------------------------------------------------------------------
+    # 1. Load image and mask
+    # ------------------------------------------------------------------
+    detector_info, image = load_data(image_path, normalize=False, verbose=False)
+    if pixel_size is None:
+        pixel_size = detector_info.get('pixel_size', None)
+        if pixel_size is None:
+            raise ValueError("Pixel size not found in metadata.")
+    pixel_size = pixel_size * binning_factor
+
+    if mask is not None:
+        import fabio
+        maskdata = fabio.open(mask).data
+        image = image.copy()
+        image[maskdata != 0] = np.nan
+
+    # ------------------------------------------------------------------
+    # 2. Detect edge angle and position (single Hough call)
+    # ------------------------------------------------------------------
+    edge_angle_rad, edge_angle_deg, edge_point, edge_line = detect_edge_angle_hough(
+        image, plot=False
+    )
+    theta_hough, rho_hough, _ = edge_line
+    x_edge_at_ymid = edge_point[0]   # x position of the edge at mid-height (info/debug)
+
+    print(f"[INFO] Edge detected: angle={edge_angle_deg:.2f}°, "
+          f"rho={rho_hough:.1f} px, x_edge≈{x_edge_at_ymid:.1f} px")
+
+    # ------------------------------------------------------------------
+    # 3. Signed distance of each pixel to the Hough line
+    #    Line equation: x·cos(θ) + y·sin(θ) = ρ
+    #    → signed distance: d(x,y) = x·cos(θ) + y·sin(θ) − ρ
+    #    (sign encodes which side of the edge the pixel lies on)
+    # ------------------------------------------------------------------
+    """
+    ny, nx = image.shape
+    y_idx, x_idx = np.indices((ny, nx))
+    d = x_idx * np.cos(theta_hough) + y_idx * np.sin(theta_hough) - rho_hough
+    """
+    ny, nx = image.shape
+    y_idx, x_idx = np.indices((ny, nx))
+
+    d_raw    = x_idx * np.cos(theta_hough) + y_idx * np.sin(theta_hough) - rho_hough
+    d_offset = (x_edge_at_ymid * np.cos(theta_hough)
+                + (ny / 2.0)   * np.sin(theta_hough)
+                - rho_hough)
+    d = d_raw - d_offset
+    # ------------------------------------------------------------------
+    # 3b. Adapt roi_half_width to the available valid pixels on each side
+    #     to enforce a symmetric ESF around the edge
+    # ------------------------------------------------------------------
+    valid = ~np.isnan(image)
+
+    # Maximum available distance on each side within the valid mask
+    d_pos_max = d[valid & (d > 0)].max() if (valid & (d > 0)).any() else roi_half_width
+    d_neg_max = np.abs(d[valid & (d < 0)].min()) if (valid & (d < 0)).any() else roi_half_width
+
+    # Symmetric half-width = smallest of: user setting, available left, available right
+    roi_half_width_eff = min(roi_half_width, d_pos_max, d_neg_max)
+    print(f"[INFO] Effective ROI half-width: {roi_half_width_eff:.1f} px "
+        f"(left={d_neg_max:.1f}, right={d_pos_max:.1f})")
+
+    roi = np.abs(d) < roi_half_width_eff   # symmetric ROI
+    # ------------------------------------------------------------------
+    # 4. Select pixels inside the ROI band around the edge
+    # ------------------------------------------------------------------
+    valid = ~np.isnan(image)
+    roi = np.abs(d) < roi_half_width
+    valid_roi = valid & roi
+
+    d_vals = d[valid_roi]
+    i_vals = image[valid_roi].astype(float)
+
+    if len(d_vals) < 100:
+        raise ValueError("Too few valid pixels in ROI. "
+                         "Check the mask or increase roi_half_width.")
+
+    # ------------------------------------------------------------------
+    # 5. Sub-pixel binning → ESF
+    # ------------------------------------------------------------------
+    d_min, d_max = d_vals.min(), d_vals.max()
+    bins        = np.linspace(d_min, d_max, nbins + 1)
+    bin_centers = 0.5 * (bins[:-1] + bins[1:])
+
+    esf_sum    = np.zeros(nbins)
+    esf_counts = np.zeros(nbins)
+    bin_idx    = np.clip(np.digitize(d_vals, bins) - 1, 0, nbins - 1)
+
+    np.add.at(esf_sum,    bin_idx, i_vals)
+    np.add.at(esf_counts, bin_idx, 1)
+
+    valid_bins = esf_counts > 0
+    x_esf      = bin_centers[valid_bins]
+    esf        = esf_sum[valid_bins] / esf_counts[valid_bins]
+
+    if len(esf) < 10:
+        raise ValueError("ESF too short after binning. "
+                         "Increase nbins or roi_half_width.")
+
+    # ------------------------------------------------------------------
+    # 6. Normalise ESF to [0, 1] and enforce rising orientation
+    # ------------------------------------------------------------------
+    esf_min, esf_max = np.nanmin(esf), np.nanmax(esf)
+    esf_norm = (esf - esf_min) / (esf_max - esf_min + 1e-12)
+
+    if esf_norm[0] > esf_norm[-1]:
+        esf_norm = esf_norm[::-1]
+        x_esf    = x_esf[::-1]
+
+    # ------------------------------------------------------------------
+    # 7. Optional erf fit → regularised ESF on a uniform grid
+    # ------------------------------------------------------------------
+    if use_erf_fit:
+        def erf_model(x, x0, sigma, a, b):
+            """Generalised error function with free amplitude and offset."""
+            return a * 0.5 * (1 + erf((x - x0) / (np.sqrt(2) * sigma))) + b
+
+        try:
+            p0 = [np.median(x_esf), 1.0, 1.0, 0.0]
+            popt, _ = curve_fit(erf_model, x_esf, esf_norm,
+                                p0=p0, maxfev=5000)
+            x_fit    = np.linspace(x_esf.min(), x_esf.max(), nbins)
+            esf_fit  = erf_model(x_fit, *popt)
+            esf_fit  = (esf_fit - esf_fit.min()) / (esf_fit.max() - esf_fit.min() + 1e-12)
+            x_esf    = x_fit
+            esf_norm = esf_fit
+            print(f"[INFO] erf fit: x0={popt[0]:.2f} px, sigma={popt[1]:.3f} px")
+        except Exception as e:
+            print(f"[WARN] erf fit failed ({e}), continuing without fit.")
+
+    # Light Gaussian smoothing
+    # Light Gaussian smoothing (skip if sigma == 0)
+    esf_smooth = gaussian_filter1d(esf_norm, sigma=smooth_sigma) if smooth_sigma > 0 else esf_norm.copy()
+
+    # ------------------------------------------------------------------
+    # 8. LSF = derivative of the ESF
+    #    dx is the sub-pixel geometric step (used for np.gradient only)
+    # ------------------------------------------------------------------
+    dx  = np.abs(np.mean(np.diff(x_esf)))   # sub-pixel step in pixels, always > 0
+    lsf = np.gradient(esf_smooth, dx)
+
+    # Hanning window to suppress spectral leakage
+    window = np.hanning(len(lsf))
+    lsf   *= window
+
+    # Normalise so that the area under the LSF equals 1
+    lsf_sum = np.sum(np.abs(lsf))
+    if lsf_sum > 0:
+        lsf /= lsf_sum
+
+    # Centre the LSF peak to avoid FFT phase artefacts
+    peak_idx     = np.argmax(lsf)
+    shift        = len(lsf) // 2 - peak_idx
+    lsf_centered = np.roll(lsf, shift)
+
+    # ------------------------------------------------------------------
+    # 8b. Resample LSF onto a 1-pixel grid before FFT
+    #     dx < 1 px (sub-pixel binning) would push the Nyquist frequency
+    #     above 0.5 cyc/px, which is unphysical.
+    #     We interpolate the LSF onto a regular 1-pixel grid so that
+    #     freq_pixel is correctly bounded to [0, 0.5] cycles/pixel.
+    # ------------------------------------------------------------------
+    x_lsf_subpix = np.arange(len(lsf_centered)) * dx   # sub-pixel axis (pixels)
+    x_lsf_1px    = np.arange(x_lsf_subpix[0],
+                              x_lsf_subpix[-1], 1.0)    # 1-pixel-step grid
+    lsf_1px      = np.interp(x_lsf_1px, x_lsf_subpix, lsf_centered)
+
+    # Re-normalise after resampling
+    lsf_sum = np.sum(np.abs(lsf_1px))
+    if lsf_sum > 0:
+        lsf_1px /= lsf_sum
+
+    # ------------------------------------------------------------------
+    # 9. FFT → MTF  (on the 1-pixel-grid LSF)
+    # ------------------------------------------------------------------
+    mtf_complex = np.fft.fft(lsf_1px)
+    mtf         = np.abs(mtf_complex)
+    mtf        /= mtf[0]                     # normalise to 1 at f = 0
+
+    n_half     = len(mtf) // 2
+    mtf        = mtf[:n_half]
+    freq_pixel = np.fft.fftfreq(len(lsf_1px), d=1.0)[:n_half]  # 0 → 0.5 cyc/px
+
+    # Physical and normalised frequencies
+    freq_phys  = freq_pixel / pixel_size      # cycles/µm
+    fnyq_phys  = 1.0 / (2.0 * pixel_size)    # Nyquist frequency in cycles/µm
+    freq_norm  = freq_phys / fnyq_phys        # normalised to Nyquist
+
+    # MTF50 and MTF20
+    mtf50_idx = np.argmin(np.abs(mtf - 0.5))
+    mtf20_idx = np.argmin(np.abs(mtf - 0.2))
+    print(f"MTF50: {freq_norm[mtf50_idx]:.3f} f_Nyq  "
+          f"({freq_phys[mtf50_idx]:.3f} µm⁻¹)")
+    print(f"MTF20: {freq_norm[mtf20_idx]:.3f} f_Nyq  "
+          f"({freq_phys[mtf20_idx]:.3f} µm⁻¹)")
     
-    # Create figure with subplots
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    
-    # Images
-    im0 = axes[0, 0].imshow(dp_before.data, cmap='viridis')
-    axes[0, 0].set_title('Before Correction')
-    axes[0, 0].axis('off')
-    plt.colorbar(im0, ax=axes[0, 0])
-    
-    im1 = axes[1, 0].imshow(dp_after.data, cmap='viridis')
-    axes[1, 0].set_title('After Correction')
-    axes[1, 0].axis('off')
-    plt.colorbar(im1, ax=axes[1, 0])
-    
-    # Histograms
-    axes[0, 1].hist(dp_before.data.flatten(), bins=100, alpha=0.7)
-    axes[0, 1].set_title('Intensity Histogram Before')
-    axes[0, 1].set_xlabel('Intensity')
-    axes[0, 1].set_ylabel('Frequency')
-    axes[0, 1].grid(True, alpha=0.3)
-    
-    axes[1, 1].hist(dp_after.data.flatten(), bins=100, alpha=0.7, color='orange')
-    axes[1, 1].set_title('Intensity Histogram After')
-    axes[1, 1].set_xlabel('Intensity')
-    axes[1, 1].set_ylabel('Frequency')
-    axes[1, 1].grid(True, alpha=0.3)
-    
-    # Radial profiles
-    radial_before = dp_before.get_radial_profile()
-    radial_after = dp_after.get_radial_profile()
-    
-    axes[0, 2].plot(radial_before)
-    axes[0, 2].set_title('Radial Profile Before')
-    axes[0, 2].set_xlabel('Radius (pixels)')
-    axes[0, 2].set_ylabel('Intensity')
-    axes[0, 2].grid(True, alpha=0.3)
-    
-    axes[1, 2].plot(radial_after, color='orange')
-    axes[1, 2].set_title('Radial Profile After')
-    axes[1, 2].set_xlabel('Radius (pixels)')
-    axes[1, 2].set_ylabel('Intensity')
-    axes[1, 2].grid(True, alpha=0.3)
-    
+    # Determine Wiener epsilon from the noise level in the ESF tail (where signal is flat)
+    signal_patch, noise_patch = extract_noise_and_signal_patches(image, edge_line)
+    wiener_epsilon = estimate_wiener_epsilon_spectral(noise_patch, signal_patch)
+    print(f"Estimated Wiener epsilon (noise/signal ratio): {wiener_epsilon:.4f}")
+
+    # ------------------------------------------------------------------
+    # 10. Diagnostic plots
+    # ------------------------------------------------------------------
+    if plot:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        # --- Image with detected edge line and ROI band ---
+        axes[0, 0].imshow(image, cmap='gray', origin='upper')
+        if np.abs(np.sin(theta_hough)) > 1e-6:
+            x_line = np.array([0, nx - 1])
+            y_line = (rho_hough - x_line * np.cos(theta_hough)) / np.sin(theta_hough)
+        else:
+            x_line = np.array([rho_hough, rho_hough])
+            y_line = np.array([0, ny - 1])
+        axes[0, 0].plot(x_line, y_line, 'r-', lw=2,
+                        label=f'Edge {edge_angle_deg:.2f}°')
+        axes[0, 0].contour(np.abs(d) < roi_half_width, levels=[0.5],
+                           colors='cyan', linewidths=1, linestyles='--')
+        axes[0, 0].set_title('Image + detected edge (red) + ROI (cyan)')
+        axes[0, 0].legend(fontsize=8)
+
+        # --- ESF ---
+        axes[0, 1].plot(x_esf, esf_norm, 'b-', linewidth=2)
+        axes[0, 1].set_xlabel('Distance to edge (pixels)')
+        axes[0, 1].set_ylabel('Normalised intensity')
+        axes[0, 1].set_title('Edge Spread Function (ESF)')
+        axes[0, 1].grid(True, alpha=0.3)
+
+        # --- LSF (resampled at 1 px for consistency with MTF) ---
+        axes[1, 0].plot(x_lsf_1px, lsf_1px, 'g-', linewidth=2)
+        axes[1, 0].set_title('Line Spread Function (LSF, 1-px grid)')
+        axes[1, 0].set_xlabel('Position (pixels)')
+        axes[1, 0].grid(True, alpha=0.3)
+
+        # --- MTF (normalised frequency axis) ---
+        axes[1, 1].plot(freq_norm, mtf, 'r-', linewidth=2, label='Measured MTF')
+        axes[1, 1].plot(freq_norm, np.sinc(freq_norm),
+                        'k--', linewidth=1.5, label='Square pixel MTF (sinc)')
+        axes[1, 1].axhline(0.5, color='gray',   linestyle='--', alpha=0.6)
+        axes[1, 1].axhline(0.2, color='orange', linestyle='--', alpha=0.6)
+        axes[1, 1].axvline(freq_norm[mtf50_idx], color='blue', linestyle=':',
+                           label=f'MTF50 = {freq_norm[mtf50_idx]:.2f} $f_{{Nyq}}$')
+        axes[1, 1].axvline(freq_norm[mtf20_idx], color='orange', linestyle=':',
+                           label=f'MTF20 = {freq_norm[mtf20_idx]:.2f} $f_{{Nyq}}$')
+        axes[1, 1].set_xlabel('Normalised spatial frequency ($f / f_{Nyquist}$)')
+        axes[1, 1].set_ylabel('MTF')
+        axes[1, 1].set_xlim(0, 1)
+        axes[1, 1].set_ylim(0, 1.05)
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        axes[1, 1].set_title('Modulation Transfer Function (MTF)')
+        secax = axes[1, 1].secondary_xaxis(
+            'top',
+            functions=(lambda f: f * fnyq_phys, lambda f: f / fnyq_phys)
+        )
+        secax.set_xlabel('Spatial frequency (µm⁻¹)')
+
+        plt.tight_layout()
+        plt.savefig('debug_mtf_slanted.png', dpi=100)
+        plt.show()
+
+    # ------------------------------------------------------------------
+    # 11. Optional output file
+    # ------------------------------------------------------------------
+    if outputfile is not None:
+        header = ("# MTF computed from slanted-edge image\n"
+                  "# Col 1: spatial frequency (cycles/pixel)\n"
+                  "# Col 2: MTF\n"
+                  "# Col 3: Wiener epsilon (noise/signal ratio) used for deconvolution\n")
+        np.savetxt(outputfile,
+                   np.column_stack((freq_pixel, mtf, np.full_like(freq_pixel, wiener_epsilon))),
+                   header=header, comments='')
+        print(f"MTF saved: {outputfile}")
+
+    return freq_pixel, mtf
+
+def estimate_wiener_epsilon_spectral(noise_patch, signal_patch, subtract_noise=True):
+    """
+    Estimate wiener_epsilon as the ratio of the power spectral densities (PSD) of noise and signal.
+    noise_patch : sub-image 2D corresponding to noise (beamstop)
+    signal_patch : sub-image 2D corresponding to signal
+    subtract_noise : if True, subtract the mean of the noise from the signal before calculation
+    """
+    # Centre signals
+    noise = noise_patch - np.nanmean(noise_patch)
+    if subtract_noise:
+        signal = signal_patch - np.nanmean(noise_patch)
+    else:
+        signal = signal_patch - np.nanmean(signal_patch)
+    # Prepare for FFT (fill NaN with 0)
+    noise_f = np.nan_to_num(noise, nan=0.0)
+    signal_f = np.nan_to_num(signal, nan=0.0)
+    # Compute PSD (FFT²), 1D or 2D depending on shape
+    if noise_f.ndim == 1:
+        noise_psd = np.abs(np.fft.fftshift(np.fft.fft(noise_f)))**2
+    else:
+        noise_psd = np.abs(np.fft.fftshift(np.fft.fft2(noise_f)))**2
+    if signal_f.ndim == 1:
+        signal_psd = np.abs(np.fft.fftshift(np.fft.fft(signal_f)))**2
+    else:
+        signal_psd = np.abs(np.fft.fftshift(np.fft.fft2(signal_f)))**2
+    # Average PSD
+    mean_noise_psd = np.mean(noise_psd)
+    mean_signal_psd = np.mean(signal_psd)
+    # Noise/signal PSD ratio
+    epsilon = np.sqrt(mean_noise_psd / (mean_signal_psd + 1e-12))
+    return epsilon
+
+
+def extract_noise_and_signal_patches(image, edge_line, band_width=500, noise_box=None, erosion_px=5):
+    """
+    Extract two 2D sub-images:
+      - signal_patch : rectangular band centred on the edge (background side)
+      - noise_patch  : rectangular band on the beamstop side (noise)
+    """
+    theta, rho, _ = edge_line
+    ny, nx = image.shape
+    y_idx, x_idx = np.indices((ny, nx))
+    # Signed distance to the Hough line (same convention as in the plot)
+    d = x_idx * np.cos(theta) + y_idx * np.sin(theta) - rho
+    # Build masks for each side of the edge, with erosion
+    # Convention: d < 0 = beamstop side (shadow, noise), d > 0 = background side (signal)
+    mask_band = np.abs(d) < (band_width / 2)
+    valid = ~np.isnan(image)
+    # Erosion: exclude a band of +/- erosion_px around the edge
+    mask_signal = (d > +erosion_px) & mask_band & valid  # background only, distance > erosion_px
+    mask_noise  = (d < -erosion_px) & mask_band & valid  # beamstop only, distance > erosion_px
+    signal_patch = image[mask_signal]
+    noise_patch  = image[mask_noise]
+    n_signal = signal_patch.size
+    n_noise = noise_patch.size
+    print(f"Signal patch (background, eroded {erosion_px}px): {n_signal} pixels, "
+          f"Noise patch (beamstop, eroded {erosion_px}px): {n_noise} pixels")
+
+    # Overlay on original image
+    plt.figure(figsize=(7, 7))
+    img_disp = np.copy(image)
+    img_disp = np.where(np.isnan(img_disp), np.nanmedian(img_disp), img_disp)
+    plt.imshow(img_disp, cmap='gray', origin='upper')
+    # Overlay noise band (beamstop) in red
+    mask_noise_disp = np.zeros_like(image, dtype=float)
+    mask_noise_disp[mask_noise] = 1.0
+    plt.contour(mask_noise_disp, levels=[0.5], colors='red', linewidths=2, linestyles='-', label='Noise (beamstop)')
+    # Overlay signal band (background) in blue
+    mask_signal_disp = np.zeros_like(image, dtype=float)
+    mask_signal_disp[mask_signal] = 1.0
+    plt.contour(mask_signal_disp, levels=[0.5], colors='blue', linewidths=1, linestyles='--', label='Signal (background)')
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color='red', lw=2, label='Noise (beamstop)'),
+        Line2D([0], [0], color='blue', lw=2, linestyle='--', label='Signal (background)')
+    ]
+    plt.title(f'Extracted zones\nNoise (beamstop, red), Signal (background, blue)\n'
+              f'Signal: {n_signal} px, Noise: {n_noise} px\nErosion: {erosion_px} px')
+    plt.axis('off')
+    plt.legend(handles=legend_elements, loc='lower right')
     plt.tight_layout()
-    
-    if save_figure:
-        plt.savefig(save_figure, dpi=300, bbox_inches='tight')
-    
     plt.show()
-    
-    # Calculate metrics
-    metrics = {
-        'snr_before': dp_before.data.mean() / dp_before.data.std(),
-        'snr_after': dp_after.data.mean() / dp_after.data.std(),
-        'mean_before': float(dp_before.data.mean()),
-        'mean_after': float(dp_after.data.mean()),
-        'std_before': float(dp_before.data.std()),
-        'std_after': float(dp_after.data.std())
-    }
-    
-    # Print summary
-    print("=" * 60)
-    print("CORRECTION COMPARISON METRICS")
-    print("=" * 60)
-    print(f"SNR Before:  {metrics['snr_before']:.2f}")
-    print(f"SNR After:   {metrics['snr_after']:.2f}")
-    print(f"SNR Change:  {metrics['snr_after']/metrics['snr_before']:.2f}x")
-    print("-" * 60)
-    print(f"Mean Before: {metrics['mean_before']:.2f}")
-    print(f"Mean After:  {metrics['mean_after']:.2f}")
-    print("-" * 60)
-    print(f"Std Before:  {metrics['std_before']:.2f}")
-    print(f"Std After:   {metrics['std_after']:.2f}")
-    print("=" * 60)
-    
-    return metrics
+
+    # 1D patch values (sanity check)
+    plt.figure(figsize=(8, 3))
+    plt.plot(noise_patch, '.', color='red', alpha=0.7, label='Noise (beamstop)')
+    plt.plot(signal_patch, '.', color='blue', alpha=0.5, label='Signal')
+    plt.title('Extracted values (1D)')
+    plt.xlabel('Index')
+    plt.ylabel('Intensity')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return signal_patch, noise_patch
+#-----------------------------------------------------------------------
+# Wiener 2D deconvolution with radial MTF
+#-----------------------------------------------------------------------
+
+def deconvolve_mtf_2d(image, mtf_file, clip=True,
+                       wiener_epsilon=None,
+                       min_epsilon=0.005,
+                       pre_smooth_sigma=0.5,
+                       use_rolloff=True,
+                       u_cutoff=0.4,
+                       rolloff_window='tukey',
+                       rolloff_alpha=0.5,
+                       rolloff_order=4,
+                       plot=False):
+    """
+    image : 2D array - image to be deconvoluted
+    mtf_file : path to mtf file - 3 columns, text format (freq, MTF, epsilon)
+    clip : bool - if True, negative values in the deconvoluted image are set to 0
+    wiener_epsilon : float or None - if None, epsilon is extracted from mtf file
+    min_epsilon : float - minimum allowed value for epsilon to avoid instability
+    pre_smooth_sigma : float, default=0.5
+        Gaussian pre-smoothing sigma (pixels) applied BEFORE deconvolution.
+        Reduces Poisson noise amplification at the cost of slight blurring.
+        Recommended: 0.5–1.0 for noisy diffraction images.
+    use_rolloff : bool, default=True
+        Apply a roll-off window to the Wiener filter to suppress noise
+        amplification at high spatial frequencies.
+    u_cutoff : float, default=0.4
+        Roll-off cutoff frequency (cycles/pixel), max=0.5 (Nyquist).
+        If None, automatically set to the frequency where MTF = epsilon
+        (i.e. MTF10 if epsilon=0.1), which is the frequency above which
+        the Wiener filter starts amplifying noise significantly.
+    rolloff_window : str, default='tukey'
+        Roll-off window type: 'hann', 'butterworth', or 'tukey'.
+    rolloff_alpha : float, default=0.5
+        For Tukey window: fraction of the flat plateau (0=Hann, 1=no rolloff).
+    rolloff_order : int, default=4
+        For Butterworth window: filter order (higher = steeper cutoff).
+    plot : bool, default=False
+        Display the Wiener filter profile.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Load MTF
+    # ------------------------------------------------------------------
+    mtf_data = np.loadtxt(mtf_file, comments='#')
+    if mtf_data.ndim != 2 or mtf_data.shape[1] < 2:
+        raise ValueError("MTF file must have 2 columns: freq (cyc/px) and MTF.")
+    freq_1d = mtf_data[:, 0]
+    mtf_1d  = mtf_data[:, 1]
+    if wiener_epsilon is None:
+        wiener_epsilon = max(mtf_data[0, 2], min_epsilon)
+    if freq_1d[0] > 0:
+        freq_1d = np.concatenate([[0.0], freq_1d])
+        mtf_1d  = np.concatenate([[1.0], mtf_1d])
+
+    # ------------------------------------------------------------------
+    # 2. Handle NaNs
+    # ------------------------------------------------------------------
+    nan_mask = np.isnan(image)
+    image_filled = image.copy().astype(float)
+    if nan_mask.any():
+        image_filled[nan_mask] = np.nanmean(image)
+
+    # ------------------------------------------------------------------
+    # 3. Optional pre-smoothing to reduce Poisson noise before deconv
+    #    Acts as a noise regulariser without affecting the MTF correction
+    # ------------------------------------------------------------------
+    if pre_smooth_sigma > 0:
+        from scipy.ndimage import gaussian_filter
+        image_filled = gaussian_filter(image_filled, sigma=pre_smooth_sigma)
+        print(f"[INFO] Pre-smoothing applied: sigma={pre_smooth_sigma} px")
+
+    # ------------------------------------------------------------------
+    # 4. Build 2D radial frequency grid
+    # ------------------------------------------------------------------
+    ny, nx = image_filled.shape
+    fy = np.fft.fftfreq(ny)
+    fx = np.fft.fftfreq(nx)
+    FX, FY = np.meshgrid(fx, fy)
+    freq_radial = np.sqrt(FX**2 + FY**2)
+
+    # ------------------------------------------------------------------
+    # 5. Interpolate MTF onto 2D grid
+    # ------------------------------------------------------------------
+    mtf_2d = np.interp(freq_radial, freq_1d, mtf_1d, left=1.0, right=0.0)
+
+    # ------------------------------------------------------------------
+    # 6. Wiener filter normalised to W(0)=1
+    # ------------------------------------------------------------------
+    wiener_filter = mtf_2d / (mtf_2d**2 + wiener_epsilon**2)
+    mtf_at_zero   = np.interp(0.0, freq_1d, mtf_1d)
+    w_at_zero     = mtf_at_zero / (mtf_at_zero**2 + wiener_epsilon**2)
+    wiener_filter /= w_at_zero
+
+    #print(f"[INFO] Wiener filter: max={wiener_filter.max():.2f}, "
+    #      f"epsilon={wiener_epsilon}, W(0)={w_at_zero:.6f}")
+
+    # ------------------------------------------------------------------
+    # 7. Optional roll-off window
+    # ------------------------------------------------------------------
+    if use_rolloff:
+        # Auto u_cutoff: frequency where MTF(u) = epsilon → amplification ~0.5/epsilon
+        # beyond this point, the filter significantly amplifies noise
+        if u_cutoff is None:
+            mtf_epsilon_idx = np.argmin(np.abs(mtf_1d - wiener_epsilon))
+            u_cutoff = freq_1d[mtf_epsilon_idx]
+            u_cutoff = np.clip(u_cutoff, 0.1, 0.5)
+            print(f"[INFO] Auto u_cutoff = {u_cutoff:.3f} cyc/px "
+                  f"(MTF = epsilon = {wiener_epsilon:.4f})")
+
+        u = freq_radial / u_cutoff
+
+        if rolloff_window == 'hann':
+            R = np.where(u <= 1.0,
+                         0.5 * (1.0 + np.cos(np.pi * u)),
+                         0.0)
+
+        elif rolloff_window == 'butterworth':
+            R = 1.0 / (1.0 + u ** (2 * rolloff_order))
+
+        elif rolloff_window == 'tukey':
+            R = np.ones_like(u)
+            mask_rolloff = (u >= rolloff_alpha) & (u <= 1.0)
+            mask_zero    = u > 1.0
+            R[mask_rolloff] = 0.5 * (1.0 + np.cos(
+                np.pi * (u[mask_rolloff] - rolloff_alpha) / (1.0 - rolloff_alpha)
+            ))
+            R[mask_zero] = 0.0
+
+        else:
+            raise ValueError(f"Unknown rolloff_window: '{rolloff_window}'. "
+                             f"Choose 'hann', 'butterworth', or 'tukey'.")
+
+        wiener_filter *= R
+        #print(f"[INFO] Roll-off applied: window={rolloff_window}, "
+        #      f"u_cutoff={u_cutoff:.3f} cyc/px, "
+        #      f"alpha={rolloff_alpha if rolloff_window == 'tukey' else 'N/A'}")
+
+    # ------------------------------------------------------------------
+    # 8. Diagnostic plot
+    # ------------------------------------------------------------------
+    if plot:
+        f_plot   = np.linspace(0, 0.5, 300)
+        mtf_plot = np.interp(f_plot, freq_1d, mtf_1d)
+        W_plot   = mtf_plot / (mtf_plot**2 + wiener_epsilon**2)
+        W_plot  /= W_plot[0]
+
+        plt.figure(figsize=(8, 4))
+        plt.plot(f_plot, mtf_plot, 'b-',  lw=1.5, label='MTF')
+        plt.plot(f_plot, W_plot,   'r--', lw=1.5, label=f'Wiener only (ε={wiener_epsilon})')
+
+        if use_rolloff:
+            u_plot = f_plot / u_cutoff
+            if rolloff_window == 'hann':
+                R_plot = np.where(u_plot <= 1.0,
+                                  0.5 * (1.0 + np.cos(np.pi * u_plot)), 0.0)
+            elif rolloff_window == 'butterworth':
+                R_plot = 1.0 / (1.0 + u_plot ** (2 * rolloff_order))
+            elif rolloff_window == 'tukey':
+                R_plot = np.ones_like(u_plot)
+                m_r = (u_plot >= rolloff_alpha) & (u_plot <= 1.0)
+                m_z = u_plot > 1.0
+                R_plot[m_r] = 0.5 * (1.0 + np.cos(
+                    np.pi * (u_plot[m_r] - rolloff_alpha) / (1.0 - rolloff_alpha)
+                ))
+                R_plot[m_z] = 0.0
+            plt.plot(f_plot, R_plot,          'g--', lw=1.5, label=f'Roll-off ({rolloff_window})')
+            plt.plot(f_plot, W_plot * R_plot, 'k-',  lw=2.0, label='Wiener × roll-off')
+            plt.axvline(u_cutoff, color='gray', linestyle=':', alpha=0.6,
+                        label=f'u_cutoff={u_cutoff:.3f}')
+
+        plt.axhline(1.0, color='gray', linestyle=':', alpha=0.4)
+        plt.axvline(0.5, color='gray', linestyle=':', alpha=0.4, label='Nyquist')
+        plt.xlabel('Spatial frequency (cycles/pixel)')
+        plt.ylabel('Amplitude')
+        plt.legend(fontsize=8)
+        plt.grid(True, alpha=0.3)
+        plt.title('Wiener deconvolution filter')
+        plt.tight_layout()
+        plt.show()
+
+    # ------------------------------------------------------------------
+    # 9. FFT → deconvolution → IFFT
+    # ------------------------------------------------------------------
+    image_fft        = np.fft.fft2(image_filled)
+    image_fft_deconv = image_fft * wiener_filter
+    image_deconv     = np.real(np.fft.ifft2(image_fft_deconv))
+
+    # ------------------------------------------------------------------
+    # 10. Restore NaNs and clip
+    # ------------------------------------------------------------------
+    if nan_mask.any():
+        image_deconv[nan_mask] = np.nan
+    if clip:
+        image_deconv = np.clip(image_deconv, 0, None)
+
+    #print(f"[INFO] Done. Input range:  [{np.nanmin(image):.1f}, {np.nanmax(image):.1f}]")
+    #print(f"       Output range: [{np.nanmin(image_deconv):.1f}, {np.nanmax(image_deconv):.1f}]")
+
+    return image_deconv
+
+
+def deconvolve_mtf_2d_rl(image, mtf_file, clip=True,
+                          n_iterations=50,
+                          tol=1e-2,
+                          pre_smooth_sigma=0,
+                          verbose=False,
+                          plot=False):
+    """
+    Richardson-Lucy 2D deconvolution with radial MTF.
+
+    Suited to Poisson noise (electron/photon counting), iterative.
+    Regularisation is implicit: too few iterations under-deconvolves,
+    too many amplifies noise.
+
+    Stopping criterion — relative change of the estimate u:
+        rel = ||u^(k+1) - u^(k)||_∞ / ||u^(k)||_∞  < tol
+    This criterion is noise-model-agnostic and detects both
+    convergence (rel → 0) and divergence (rel grows).
+
+    Note: the Morozov discrepancy principle (chi²/pixel = 1) assumes
+    data in raw Poisson count units. For normalised/calibrated images
+    (e.g. ePDF), it is not directly applicable.
+
+    Parameters
+    ----------
+    image           : 2D array  - image to deconvolve
+    mtf_file        : str       - MTF file (3 columns: freq, MTF, epsilon)
+    clip            : bool      - if True, negative values are set to 0
+    n_iterations    : int       - maximum number of iterations (safety cap, default 50)
+    tol             : float|None- relative change threshold ||Δu||/||u||
+                                  for early stopping (default 1e-2). None = disabled.
+    pre_smooth_sigma: float     - Gaussian pre-smoothing sigma in pixels
+                                  before deconvolution (0 = disabled)
+    verbose         : bool      - if True, print rel_change at each iteration
+    plot            : bool      - display PSF profile
+
+    Returns
+    -------
+    image_deconv : 2D array - deconvolved image
+    """
+    # ------------------------------------------------------------------
+    # 1. Load MTF
+    # ------------------------------------------------------------------
+    mtf_data = np.loadtxt(mtf_file, comments='#')
+    if mtf_data.ndim != 2 or mtf_data.shape[1] < 2:
+        raise ValueError("MTF file must have 2 columns: freq (cyc/px) and MTF.")
+    freq_1d = mtf_data[:, 0]
+    mtf_1d  = mtf_data[:, 1]
+    if freq_1d[0] > 0:
+        freq_1d = np.concatenate([[0.0], freq_1d])
+        mtf_1d  = np.concatenate([[1.0], mtf_1d])
+
+    # ------------------------------------------------------------------
+    # 2. Handle NaNs
+    # ------------------------------------------------------------------
+    nan_mask = np.isnan(image)
+    image_filled = image.copy().astype(float)
+    if nan_mask.any():
+        image_filled[nan_mask] = np.nanmean(image)
+
+    # ------------------------------------------------------------------
+    # 3. Optional pre-smoothing
+    # ------------------------------------------------------------------
+    if pre_smooth_sigma > 0:
+        from scipy.ndimage import gaussian_filter
+        image_filled = gaussian_filter(image_filled, sigma=pre_smooth_sigma)
+        #print(f"[INFO] Pre-smoothing applied: sigma={pre_smooth_sigma} px")
+
+    # ------------------------------------------------------------------
+    # 4. Build 2D radial PSF (= IFFT of 2D MTF)
+    #    Convolutions are performed in the frequency domain
+    # ------------------------------------------------------------------
+    ny, nx = image_filled.shape
+    fy = np.fft.fftfreq(ny)
+    fx = np.fft.fftfreq(nx)
+    FX, FY = np.meshgrid(fx, fy)
+    freq_radial = np.sqrt(FX**2 + FY**2)
+    mtf_2d = np.interp(freq_radial, freq_1d, mtf_1d, left=1.0, right=0.0)
+
+    # ------------------------------------------------------------------
+    # 5. Richardson-Lucy algorithm
+    #    u^(k+1) = u^(k) * (h* ⊛ (I / (h ⊛ u^(k))))
+    #    implemented in the frequency domain (convolution = multiplication)
+    # ------------------------------------------------------------------
+    # Initialise with the observed image (clipped positive)
+    u = np.clip(image_filled.copy(), 1e-6, None)
+    I = np.clip(image_filled.copy(), 1e-6, None)
+
+    # MTF is symmetric (real, positive) → h* = h in frequency domain
+    H  = mtf_2d          # convolution with h
+    Ht = mtf_2d          # convolution with h* (symmetric PSF → identical)
+
+    for i in range(n_iterations):
+        u_prev = u.copy()
+
+        # Convolution de l'estimation courante avec la PSF
+        u_fft  = np.fft.fft2(u)
+        Hu     = np.real(np.fft.ifft2(H * u_fft))
+        Hu     = np.clip(Hu, 1e-12, None)   # avoid division by zero
+
+        # Observed / convolved estimate ratio
+        ratio     = I / Hu
+        ratio_fft = np.fft.fft2(ratio)
+
+        # Correlation with the flipped PSF
+        correction = np.real(np.fft.ifft2(Ht * ratio_fft))
+
+        # Update
+        u = u * np.clip(correction, 0, None)
+
+        # ------------------------------------------------------------------
+        # Stopping criterion: relative change of the estimate u
+        #   rel = ||u^(k+1) - u^(k)||_∞ / ||u^(k)||_∞
+        # Convergence: rel → 0.  Divergence: rel grows (noise amplification).
+        # ------------------------------------------------------------------
+        if tol is not None:
+            rel = np.max(np.abs(u - u_prev)) / (np.max(u_prev) + 1e-12)
+            if verbose:
+                print(f"[RL] iter {i+1:4d} | Δrel={rel:.4e}")
+            if rel < tol:
+                print(f"[RL] Converged at iteration {i+1} "
+                      f"(Δrel={rel:.2e} < {tol})")
+                break
+            if i + 1 == n_iterations:
+                print(f"[RL] Maximum iterations reached ({n_iterations}) "
+                      f"without convergence (Δrel={rel:.2e}).\n"
+                      f"    → Increase n_iterations or tol, "
+                      f"or enable pre_smooth_sigma to slow divergence.")
+
+    image_deconv = u
+
+    # ------------------------------------------------------------------
+    # 6. Diagnostic PSF plot
+    # ------------------------------------------------------------------
+    if plot:
+        f_plot   = np.linspace(0, 0.5, 300)
+        mtf_plot = np.interp(f_plot, freq_1d, mtf_1d)
+        # 1D PSF ≈ IFFT of 1D MTF (central profile)
+        n_psf = 256
+        mtf_sym = np.interp(np.fft.fftfreq(n_psf, d=1.0), freq_1d, mtf_1d)
+        psf_1d  = np.real(np.fft.ifftshift(np.fft.ifft(mtf_sym)))
+        x_psf   = np.arange(n_psf) - n_psf // 2
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        axes[0].plot(f_plot, mtf_plot, 'b-', lw=2)
+        axes[0].set_xlabel('Spatial frequency (cycles/pixel)')
+        axes[0].set_ylabel('MTF')
+        axes[0].set_title('MTF used (Richardson-Lucy)')
+        axes[0].axvline(0.5, color='gray', linestyle=':', alpha=0.5, label='Nyquist')
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+
+        axes[1].plot(x_psf, psf_1d / psf_1d.max(), 'r-', lw=2)
+        axes[1].set_xlabel('Position (pixels)')
+        axes[1].set_ylabel('Normalised PSF')
+        axes[1].set_title('Radial PSF (1D profile)')
+        axes[1].set_xlim(-20, 20)
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    # ------------------------------------------------------------------
+    # 7. Restore NaNs and clip
+    # ------------------------------------------------------------------
+    if nan_mask.any():
+        image_deconv[nan_mask] = np.nan
+    if clip:
+        image_deconv = np.clip(image_deconv, 0, None)
+
+    #print(f"[INFO] Richardson-Lucy ({n_iterations} iter). "
+    #      f"Input range:  [{np.nanmin(image):.1f}, {np.nanmax(image):.1f}]")
+    #print(f"       Output range: [{np.nanmin(image_deconv):.1f}, {np.nanmax(image_deconv):.1f}]")
+
+    return image_deconv
+
+
+
+
+
+
+
+

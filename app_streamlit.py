@@ -18,7 +18,6 @@ from ePDFsuite import SAEDProcessor, extract_epdf
 from recalibration import recalibrate_with_beamstop_noponi
 from filereader import load_data
 from pdf_extraction import compute_ePDF
-#from calibration import perform_geometric_calibration
 import hyperspy.api as hs
 
 # Initialize session state variables
@@ -310,6 +309,35 @@ with tab1:
     
     # ========== VALIDATION BUTTON ==========
     st.markdown("---")
+    
+    # MTF deconvolution parameters (actifs uniquement si un fichier MTF est fourni)
+    _any_mtf = (sample_mtf is not None) or (ref_mtf is not None)
+    if _any_mtf:
+        st.markdown("### 🔧 MTF Deconvolution Parameters")
+        col_mtf1, col_mtf2 = st.columns(2)
+        with col_mtf1:
+            mtf_filter = st.selectbox(
+                "Filter method",
+                options=['rl', 'wiener'],
+                format_func=lambda x: 'Richardson-Lucy (iterative)' if x == 'rl' else 'Wiener (inverse filter)',
+                index=0,
+                help="RL : Richardson-Lucy (iterative method) · Wiener : inverse filter with Wiener regularization (faster but may amplify noise if not careful with epsilon)"
+            )
+        with col_mtf2:
+            if mtf_filter == 'rl':
+                mtf_n_iterations = st.number_input("Iterations (RL)", value=50, min_value=1, step=1)
+                mtf_wiener_epsilon = None
+            else:
+                mtf_wiener_epsilon = st.number_input(
+                    "Wiener epsilon", value=1e-2, format="%.2e", min_value=1e-10,
+                    help="Wiener regularization parameter (epsilon) to prevent noise amplification. Smaller values preserve more high-frequency details but may amplify noise. Adjust based on your data quality."
+                )
+                mtf_n_iterations = 50
+    else:
+        mtf_filter = 'rl'
+        mtf_n_iterations = 50
+        mtf_wiener_epsilon = None
+
     if st.button("✅ Validate and Create Processors", type="primary"):
         if sample_image is None:
             st.error("❌ Please upload a sample image first")
@@ -321,6 +349,9 @@ with tab1:
                     poni_file=st.session_state.sample_poni_path,
                     mask=st.session_state.get('sample_mask_path', None),
                     mtf_file=st.session_state.get('sample_mtf_path', None),
+                    filter=mtf_filter,
+                    n_iterations=mtf_n_iterations,
+                    wiener_epsilon=mtf_wiener_epsilon,
                     verbose=False
                 )
                 st.session_state.sample_processor.initial_center = st.session_state.sample_center
@@ -332,6 +363,9 @@ with tab1:
                         poni_file=st.session_state.ref_poni_path,
                         mask=st.session_state.get('ref_mask_path', None),
                         mtf_file=st.session_state.get('ref_mtf_path', None),
+                        filter=mtf_filter,
+                        n_iterations=mtf_n_iterations,
+                        wiener_epsilon=mtf_wiener_epsilon,
                         verbose=False
                     )
                     st.session_state.ref_processor.initial_center = st.session_state.ref_center
