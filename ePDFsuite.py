@@ -1,5 +1,5 @@
 from filereader import load_data
-from recalibration import recalibrate_with_beamstop, recalibrate_with_beamstop_noponi
+from recalibration import recalibrate_from_isocurve
 from pdf_extraction import compute_ePDF
 from pyFAI import load
 import fabio
@@ -7,6 +7,16 @@ from matplotlib import pyplot as plt
 from matplotlib.colors import LogNorm
 import numpy as np
 import hyperspy.api as hs
+
+def _mask_as_array(mask):
+    """Return a boolean ndarray from a mask that may be a file path or already an ndarray."""
+    if mask is None:
+        return None
+    if isinstance(mask, np.ndarray):
+        return mask.astype(bool)
+    
+    return fabio.open(mask).data.astype(bool)
+
 
 
 class SAEDProcessor:
@@ -16,135 +26,160 @@ class SAEDProcessor:
                 mask=None,
                 # deconvolution parameters
                 mtf_file=None,
-                filter = 'rl', # or 'wiener',
-                n_iterations=50, # for rl deconvolution
                 wiener_epsilon=None,
                 verbose=False):
         """
-        Initialize a SAED data processor.
-        
+        Initialise a SAED data processor.
+
+        Loads the image, identifies the camera type and wavelength from
+        metadata, optionally applies MTF deconvolution (Wiener filter), and
+        prepares the pyFAI azimuthal integrator if a PONI file is provided.
+
         Parameters
         ----------
         image_file : str
-            SAED data file in DM4, DM3, tif, tiff format
+            Path to the SAED data file (DM4, DM3, tif, tiff).
         poni_file : str, optional
-            Geometric calibration file in .poni format
+            Path to the pyFAI geometric calibration file (.poni).
+            If ``None``, a pixel-scale integrator is used.
         mask : str, optional
-            Mask file for the image
+            Path to a fabio mask file (EDF or similar). Convention:
+            0 = valid pixel, 1 = masked pixel.
         mtf_file : str, optional
-            MTF file for deconvolution by camera MTF
-        wiener_epsilon : float
-            Wiener filter epsilon for MTF deconvolution
-        verbose : bool
-            If True, prints metadata information
+            Path to the MTF file used for Wiener deconvolution.
+            If ``None``, no deconvolution is applied.
+        wiener_epsilon : float, optional
+            Regularisation parameter for the Wiener filter.
+            If ``None``, read from column 3 of the MTF file.
+        verbose : bool, optional
+            If ``True``, print metadata and detector info. Default is ``False``.
         """
         self.dm4_file = image_file
         self.poni_file = poni_file
-        self.initial_center = None  # To be set by user after inspection via plot()
-        metadata, img = load_data(image_file,verbose=verbose)
+        metadata, img = load_data(image_file, verbose=verbose)
         self.metadata = metadata
         self.img = img
+
+        # load mask if provided, otherwise create an empty mask
         if mask is not None:
             mask_img = fabio.open(mask)
             self.mask = mask_img.data
         else:
             self.mask = np.zeros_like(self.img)
-        
+        # load poni file if provided, and prepare pyFAI integrator
         if poni_file is not None:
             self.ai = load(poni_file)
-            self.use_pyfai=True
+            self.use_pyfai = True
             if mask is not None:
                 mask_img = fabio.open(mask)
                 self.mask = mask_img.data.astype(bool)
             else:
                 self.mask = np.zeros(self.img.shape, dtype=bool)
         else:
-            img = hs.load(image_file)
-            self.use_pyfai=False
-            self.scale = img.axes_manager[0].scale# in nm/pixel
-            self.units = img.axes_manager[0].units
+            _hs_img = hs.load(image_file)
+            self.use_pyfai = False
+            self.scale = _hs_img.axes_manager[0].scale
+            self.units = _hs_img.axes_manager[0].units
             print(f'scale = {self.scale}, unit = {self.units}')
+
+        # load and apply MTF deconvolution (Wiener filter) if MTF file is provided
         if mtf_file is not None:
-            self.ismtf = True            
-            from utilities import deconvolve_mtf_2d, deconvolve_mtf_2d_rl
-            if filter =='wiener':
-                self.img = deconvolve_mtf_2d(self.img, mtf_file, wiener_epsilon=wiener_epsilon)
-            elif filter == 'rl':
-                self.img = deconvolve_mtf_2d_rl(self.img, mtf_file, n_iterations=n_iterations, plot=False)
+            self.ismtf = True
+            from utilities import deconvolve_mtf_2d
+            self.img = deconvolve_mtf_2d(self.img, mtf_file, wiener_epsilon=wiener_epsilon)
         else:
             self.ismtf = False
-        # flag to skip recalibration if already done once, to speed up parameter adjustments in interactive mode 
-        self.skip_center_recalibration = False 
+
+        # check binning
+        if self.metadata['image_height'] != self.img.shape[0] or self.metadata['image_width'] != self.img.shape[1]:
+            self.binning = self.metadata['image_height'] / self.img.shape[0]
+        else:
+            self.binning = 1
+
+        # Determine beam centre automatically via iso-intensity contour method.
+        # Fall back to the intensity-maximum if isocurve detection fails.
+        try:
+            cx, cy = recalibrate_from_isocurve(
+                self.img, mask=_mask_as_array(self.mask), plot=False
+            )
+            print(f'Centre estimate from iso-intensity contours: (x={cx:.2f}, y={cy:.2f})')
+        except Exception as _e:
+            _yx = np.unravel_index(np.argmax(self.img), self.img.shape)
+            cy, cx = float(_yx[0]), float(_yx[1])
+            print(
+                f'Warning: iso-intensity centre detection failed ({_e}). '
+                f'Falling back to intensity maximum: (x={cx:.1f}, y={cy:.1f}). '
+                'Refine manually in the app.'
+            )
+        self.center = (cx, cy)
 
             
 
 
-    def integrate(self, dm4_file=None, npt=2500, initial_center=None, plot=False):
+    def integrate(self, dm4_file=None, npt=2500, center=None, plot=False):
         """
-        Integrate SAED pattern to 1D.
-        
+        Azimuthally integrate the SAED pattern to a 1D I(q) profile.
+
+        Beam centre recalibration is always performed with
+        :func:`recalibrate_from_isocurve` using ``self.center`` as the
+        initial estimate.  If *center* is provided it overwrites
+        ``self.center`` and is used directly without re-running isocurve.
+
         Parameters
         ----------
         dm4_file : str, optional
-            File to integrate. If None, uses self.dm4_file
-        npt : int
-            Number of points in output
-        initial_center : tuple, optional
-            Initial center (x, y) in pixels. If None, uses self.initial_center
-        plot : bool
-            If True, displays the integrated pattern
-        
+            Path to an alternative DM4 file to integrate. If ``None``,
+            uses ``self.dm4_file``.
+        npt : int, optional
+            Number of points in the output q profile. Default is 2500.
+        center : tuple of float, optional
+            Beam centre ``(x, y)`` in pixels.  If provided, overwrites
+            ``self.center`` before integrating.  If ``None``, uses
+            ``self.center`` as computed at initialisation.
+        plot : bool, optional
+            If ``True``, display the integrated I(q) pattern. Default is ``False``.
+
         Returns
         -------
-        q : array
-            Scattering vector
-        I : array
-            Integrated intensity
+        q : ndarray
+            Scattering vector in Å⁻¹.
+        I : ndarray
+            Azimuthally averaged intensity.
         """
-        
-        
-        
-        # Use provided initial_center, or fall back to self.initial_center
-        center = initial_center if initial_center is not None else self.initial_center
-        
-        if self.use_pyfai:
-            
-            # perform MTF correction if MTF data is available  
-            if not self.skip_center_recalibration:          
-                self.ai = recalibrate_with_beamstop(self.dm4_file, self.poni_file, initial_center=center,mask=self.mask) # seek beamcentre
-            else:
-                pass
-            # integrate using pyFAI with the calibrated ai and mask (self.img is mtf deconvoluted in initialization if mtf_file is provided)
-            q, I = self.ai.integrate1d(self.img, npt, mask = self.mask, unit="q_A^-1", polarization_factor=0.99)
-            
-            
+        if center is not None:
+            # User-supplied centre: store and use directly
+            self.center = center
+        cx, cy = float(self.center[0]), float(self.center[1])
 
-        else: # intégration personnalisée sans pyFAI, pour les cas où il n'y a pas de fichier de calibration ou que les images ont des résolutions différentes
-                                                        
-            # Recalibrer le centre
-            if not self.skip_center_recalibration:
-                center_x, center_y = recalibrate_with_beamstop_noponi(self.img, threshold_rel=0.5, min_size=50, initial_center=center, plot=False)
-            else:
-                center_x = self.initial_center[0]; center_y = self.initial_center[1]
-            # Calculer le profil radial
-            y, x = np.indices(self.img.shape)
-            r = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-            
-            # Arrondir les distances pour créer des bins
-            r_int = r.astype(int)
-            
-            # Calculer le profil radial (moyenne azimutale)
-            radial_bins = np.bincount(r_int.ravel(), weights=self.img.ravel())
-            radial_counts = np.bincount(r_int.ravel())
+        if self.use_pyfai:
+            fit2d = self.ai.getFit2D()
+            fit2d['centerX'] = cx
+            fit2d['centerY'] = cy
+            self.ai.setFit2D(**fit2d)
+            q, I = self.ai.integrate1d(
+                self.img, npt, mask=self.mask, unit="q_A^-1", polarization_factor=0.99
+            )
+        else:
+            mask_bool = np.asarray(self.mask, dtype=bool)
+            valid = ~mask_bool.ravel()
+            y_idx, x_idx = np.indices(self.img.shape)
+            r = np.sqrt((x_idx - cx)**2 + (y_idx - cy)**2)
+            r_int = r.astype(int).ravel()
+            img_flat = self.img.ravel()
+            radial_bins = np.bincount(r_int[valid], weights=img_flat[valid],
+                                      minlength=r_int.max() + 1)
+            radial_counts = np.bincount(r_int[valid], minlength=r_int.max() + 1)
             I = radial_bins / radial_counts
-    
-            # Axe q (distances radiales)
-            q = np.arange(len(I))#pixel array
-            
-            q = q * self.scale  # Convertir les distances en unités physiques (ex: nm)
-            q *= 2*np.pi  # Convertir en q (Å^-1) si les distances sont en nm
+            q = np.arange(len(I))
             if self.units == '1/nm':
-                q /= 10  # Convertir en Å^-1 si les distances sont en nm
+                q = q * self.scale * 2 * np.pi / 10
+            elif self.units == 'mrad':
+                theta = q * self.scale * 1e-3
+                q = 4 * np.pi * np.sin(theta) / self.metadata['wavelength']
+                q /= self.binning
+            else:
+                q = q * self.scale * 2 * np.pi
+                
 
         
 
@@ -160,8 +195,9 @@ class SAEDProcessor:
         return q, I
     
     def plot(self,vmin=-4, vmax=0,cmap='jet',display_mask=False):
+        plt.figure()
         if display_mask:
-            plt.figure()
+            
             # Create a copy of the image for display
             img_display = self.img.copy() / np.max(self.img)
             # Set masked pixels to NaN to display them in white
@@ -171,261 +207,232 @@ class SAEDProcessor:
             current_cmap = plt.get_cmap(cmap).copy()
             current_cmap.set_bad(color='white')
             plt.imshow(img_display, cmap=current_cmap, norm=LogNorm(vmin=10**(vmin), vmax=10**(vmax)))
-        else:
-            plt.figure()
+            plt.plot(self.center[0], self.center[1], 'k+', markersize=8)
+        else:            
             plt.imshow(self.img/np.max(self.img), cmap=cmap, norm=LogNorm(vmin=10**(vmin), vmax=10**(vmax)))
+        #plot center as wihte cross
+            plt.plot(self.center[0], self.center[1], 'w+', markersize=8)
+
     
-    def plot_recalibrated_image(self, initial_center=None):
+    def plot_recalibrated_image(self, **kwargs):
         """
-        Plot the diffraction image with detected center and rings.
-        
+        Display the diffraction image with the detected beam centre.
+
+        Runs :func:`recalibrate_from_isocurve` with ``plot=True``
+        to trigger the diagnostic figure, using ``self.center`` as
+        the initial estimate.  The result is not stored.
+
         Parameters
         ----------
-        initial_center : tuple, optional
-            Initial center (x, y) in pixels. If None, uses self.initial_center
+        **kwargs
+            Extra keyword arguments forwarded to
+            :func:`recalibrate_from_isocurve` (e.g. ``n_levels``,
+            ``level_range``, ``rms_rel_max``, ``min_arc_deg``,
+            ``cluster_window``).
         """
-        center = initial_center if initial_center is not None else self.initial_center
-        
-        if self.use_pyfai:
-            # Note: The mask display is handled inside recalibrate_with_beamstop
-            _ = recalibrate_with_beamstop(self.dm4_file, self.poni_file, initial_center=center, mask=self.mask, plot=True)
-            
+        recalibrate_from_isocurve(
+            self.img, mask=_mask_as_array(self.mask), plot=True,
+            initial_center=self.center, **kwargs
+        )
+
+    def inspect_histogram(self, bins=256, log_scale=True, exclude_zero=False,
+                          saturation_threshold=0.98, percentile_clip=99.9999):
+        """
+        Plot the grey-level histogram of the image to assess camera linearity.
+
+        Always displays two side-by-side subplots:
+
+        * **Left** — full image (no mask), full x-axis range, so that
+          saturated pixels from e.g. the direct beam are visible.
+        * **Right** — valid pixels only (mask applied, if a mask was
+          provided), with the x-axis clipped to ``percentile_clip`` to
+          reveal the bulk distribution.
+
+        A smooth, monotonically decreasing histogram with no spike at the
+        maximum indicates a linear camera response.
+
+        Parameters
+        ----------
+        bins : int, optional
+            Number of histogram bins. Default is 256.
+        log_scale : bool, optional
+            If ``True`` (default), both y-axes are in log scale.
+        exclude_zero : bool, optional
+            If ``True``, zero-valued pixels are excluded from both
+            histograms. Default is ``False``.
+        saturation_threshold : float, optional
+            Fraction of the global maximum above which pixels are flagged
+            as potentially saturated. A vertical red dashed line is drawn
+            at this value on both subplots. Default is 0.98.
+        percentile_clip : float, optional
+            Percentile used to clip the x-axis of the **masked** (right)
+            subplot only. Useful when a few very bright pixels compress the
+            distribution towards zero. Default is 99.9999. Set to 100 to
+            disable clipping.
+
+        Returns
+        -------
+        counts_raw : ndarray
+            Pixel counts per bin for the unmasked histogram.
+        edges_raw : ndarray
+            Bin edges for the unmasked histogram.
+        counts_masked : ndarray or None
+            Pixel counts per bin for the masked histogram, or ``None`` if
+            no mask is defined.
+        edges_masked : ndarray or None
+            Bin edges for the masked histogram, or ``None`` if no mask.
+        """
+        # Saturation threshold based on the full-image maximum
+        all_data = self.img.ravel().astype(float)
+        sat_value = saturation_threshold * all_data.max()
+
+        # --- unmasked data (left subplot) ---
+        data_raw = all_data.copy()
+        if exclude_zero:
+            data_raw = data_raw[data_raw > 0]
+
+        # --- masked data (right subplot) ---
+        has_mask = self.mask is not None and np.any(self.mask != 0)
+        if has_mask:
+            data_masked = self.img[self.mask == 0].ravel().astype(float)
+            if exclude_zero:
+                data_masked = data_masked[data_masked > 0]
         else:
-            _ = recalibrate_with_beamstop_noponi(self.img, initial_center=center, plot=True)
+            data_masked = data_raw  # fallback: same data
+
+        counts_raw, edges_raw = np.histogram(data_raw, bins=bins)
+        centers_raw = 0.5 * (edges_raw[:-1] + edges_raw[1:])
+
+        counts_masked, edges_masked = np.histogram(data_masked, bins=bins)
+        centers_masked = 0.5 * (edges_masked[:-1] + edges_masked[1:])
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+
+        def _draw(ax, centers, counts, edges, title, clip_xaxis):
+            ax.bar(centers, counts, width=np.diff(edges), align='center',
+                   color='steelblue', edgecolor='none', alpha=0.8)
+            ax.axvline(sat_value, color='red', linestyle='--', linewidth=1.2,
+                       label=f'Sat. threshold ({saturation_threshold*100:.0f}% = {sat_value:.0f} cts)')
+            if clip_xaxis and percentile_clip < 100:
+                xmax = np.percentile(data_masked, percentile_clip)
+                ax.set_xlim(left=0, right=xmax)
+            if log_scale:
+                ax.set_yscale('log')
+            ax.set_xlabel('Grey level (counts)')
+            ax.set_ylabel('Number of pixels')
+            ax.set_title(title)
+            ax.legend(fontsize=8)
+
+        _draw(axes[0], centers_raw, counts_raw, edges_raw,
+              title='Raw image (no mask) — full range',
+              clip_xaxis=False)
+
+        masked_title = (f'Masked image — x clipped at {percentile_clip}th percentile'
+                        if has_mask else 'No mask provided — same as raw')
+        _draw(axes[1], centers_masked, counts_masked, edges_masked,
+              title=masked_title,
+              clip_xaxis=True)
+
+        plt.suptitle('Image histogram — camera linearity check', fontsize=12, y=1.01)
+        plt.tight_layout()
+        plt.show()
+
+        # --- warnings (on masked data if available, raw otherwise) ---
+        data_check = data_masked if has_mask else data_raw
+        n_sat = int(np.sum(data_check >= sat_value))
+        label = 'masked image' if has_mask else 'image'
+        if n_sat > 0:
+            print(f"Warning: {n_sat} pixel(s) in {label} above the saturation threshold "
+                  f"({saturation_threshold*100:.0f}% of max = {sat_value:.0f} counts). "
+                  "Camera linearity may be compromised.")
+        else:
+            print(f"No saturated pixels detected in {label} — camera response appears linear.")
+
+        return 
+
 
     def extract_epdf(self,
                      ref_diffraction_image=None,
                      ref_poni_file=None,
-                     composition = 'Au',                     
+                     composition='Au',
                      rmin=0.1,
                      rmax=50.0,
                      rstep=0.01,
                      outputfile=None,
-                     interactive = True,
-                     plot = False,
+                     interactive=True,
+                     plot=False,
                      mtf_file=None,
                      bgscale=1,
                      qmin=1.5,
                      qmax=24,
                      qmaxinst=24,
-                     rpoly=1.4,
-                     initial_center=None,
-                     initial_center_ref=None):
+                     rpoly=1.4):
         """
-        Extract ePDF from SAED data (legacy method, prefer using extract_epdf function).
-        
-        This method creates a temporary SAEDProcessor for the reference and calls
-        the standalone extract_epdf function.
-        
+        Extract the ePDF from the SAED data (convenience wrapper).
+
+        Creates a :class:`SAEDProcessor` for the reference image if provided
+        (which automatically computes its own beam centre via isocurve at
+        initialisation), then delegates to the standalone :func:`extract_epdf`
+        function.
+
         Parameters
         ----------
         ref_diffraction_image : str, optional
-            Path to reference diffraction image
+            Path to the reference (background) diffraction image.
         ref_poni_file : str, optional
-            Path to reference poni file (if different from sample)
-        composition : str
-            Chemical composition
-        rmin, rmax, rstep : float
-            PDF r-range parameters
+            Path to a PONI file for the reference image if it differs from
+            the sample.
+        composition : str, optional
+            Chemical formula of the sample (e.g. ``'Au'``, ``'SiO2'``).
+            Default is ``'Au'``.
+        rmin, rmax, rstep : float, optional
+            Real-space range and step for G(r) in Å.
         outputfile : str, optional
-            Output filename
-        interactive : bool
-            If True, shows interactive GUI
-        plot : bool
-            If True, plots results (non-interactive mode)
-        bgscale, qmin, qmax, qmaxinst, rpoly : float
-            PDF computation parameters
-        initial_center : tuple, optional
-            Override self.initial_center for this call
-        initial_center_ref : tuple, optional
-            Initial center for reference image
-        
+            Path for the output ``.gr`` file. Auto-generated if ``None``.
+        interactive : bool, optional
+            If ``True`` (default), open the interactive slider GUI.
+        plot : bool, optional
+            If ``True``, display plots in non-interactive mode.
+        mtf_file : str, optional
+            Not used in this wrapper (MTF applied at initialisation).
+        bgscale : float, optional
+            Background scaling factor. Default is 1.
+        qmin, qmax, qmaxinst : float, optional
+            Q-range limits in Å⁻¹ for PDF computation.
+        rpoly : float, optional
+            Polynomial background degree control (PDFgetX3 convention).
+
         Returns
         -------
         results : PDFResultsReference or tuple
-            PDF results
+            Interactive mode: :class:`PDFResultsReference` supporting
+            ``r, g = results`` unpacking.
+            Non-interactive mode: ``(r, G)`` tuple of ndarrays.
         """
-        # Create reference processor if provided
         ref_processor = None
         if ref_diffraction_image is not None:
             ref_processor = SAEDProcessor(
                 ref_diffraction_image,
                 poni_file=ref_poni_file if ref_poni_file is not None else self.poni_file,
-                verbose=False
+                verbose=False,
             )
-            # Set initial center for reference
-            if initial_center_ref is not None:
-                ref_processor.initial_center = initial_center_ref
-            elif initial_center is not None:
-                ref_processor.initial_center = initial_center
-        
-        # Temporarily override initial_center if provided
-        original_center = self.initial_center
-        if initial_center is not None:
-            self.initial_center = initial_center
-        
-        try:
-            # Call standalone function
-            return extract_epdf(
-                sample_processor=self,
-                ref_processor=ref_processor,
-                composition=composition,
-                rmin=rmin,
-                rmax=rmax,
-                rstep=rstep,
-                outputfile=outputfile,
-                interactive=interactive,
-                plot=plot,
-                bgscale=bgscale,
-                qmin=qmin,
-                qmax=qmax,
-                qmaxinst=qmaxinst,
-                rpoly=rpoly
-            )
-        finally:
-            # Restore original center
-            self.initial_center = original_center
-        # retrive wavelength from metadata
-        wavelength = self.metadata['wavelength']
-        camera = self.metadata['camera_title']
-        sample_diffraction_image = self.dm4_file
 
-        # add attributes to class for further use in PDFinteractive
-        self.ref_diffraction_image = ref_diffraction_image
-        self.composition = composition
-        # load sample and reference images
-        info , sample_data = load_data(sample_diffraction_image, verbose=False)
-        if ref_diffraction_image:
-            _, ref_data = load_data(ref_diffraction_image, verbose=False)
-        else:
-            ref_data = None    
-        
-
-        # Recalibrate centre
-        if self.use_pyfai:
-            # Use the already calibrated AzimuthalIntegrator from self.ai if available,
-            # otherwise recalibrate
-            if hasattr(self, 'ai') and self.ai is not None:
-                ai = self.ai
-            else:
-                # Initialize Azimuthal Integrator from poni file and recalibrate
-                
-                ai = recalibrate_with_beamstop(
-                dm4file=sample_diffraction_image,
-                ponifile=self.poni_file,
-                threshold_rel=0.5,
-                min_size=80,
-                initial_center=initial_center,
-                plot=False
-                )
-                # Store the calibrated ai for future use
-                self.ai = ai
-            
-            # Integrate sample image
-            q_sample, intensity_sample = ai.integrate1d(
-                sample_data,
-                npt=2500,
-                unit="q_A^-1")
-            
-            # Integrate reference image
-            if ref_data is not None:
-                # If ref_poni_file is provided or images have different resolutions
-                if ref_poni_file is not None or ref_data.shape != sample_data.shape:
-                    # Recalibrate separately for reference
-                    poni_for_ref = ref_poni_file if ref_poni_file is not None else self.poni_file
-                    
-                    ai_ref = recalibrate_with_beamstop(
-                        dm4file=ref_diffraction_image,
-                        ponifile=poni_for_ref,
-                        threshold_rel=0.5,
-                        min_size=80,
-                        initial_center=initial_center_ref if initial_center_ref is not None else initial_center,
-                        plot=False
-                    )
-                else:
-                    # Use same ai if resolutions match
-                    ai_ref = ai
-                
-                q_ref, intensity_ref = ai_ref.integrate1d(
-                    ref_data,
-                    npt=2500,
-                    unit="q_A^-1")
-        else:# no poni file, use custom integration
-            q_sample, intensity_sample = self.integrate(self.dm4_file, initial_center=initial_center, plot=False)
-            q_ref, intensity_ref = self.integrate(dm4_file= ref_diffraction_image, initial_center=initial_center_ref if initial_center_ref is not None else initial_center, plot=False) if ref_data is not None else (None, None)
-        
-        if outputfile is None:
-            # repalce None by default name based on sample image name
-            outputfile = sample_diffraction_image.split('.')[0] + '_pdf.gr'
-
-        if interactive:
-            # Create PDFInteractive object
-            pdf_interactive = PDFInteractive(
-                q_sample,
-                intensity_sample,
-                composition=composition,
-                rmin=rmin,
-                rmax=rmax,
-                rstep=rstep,
-                ref_diffraction_image=ref_diffraction_image if ref_diffraction_image is not None else None,
-                outputfile=outputfile,
-                SAEDProcessor=self,
-                initial_center=initial_center,
-                initial_center_ref=initial_center_ref,
-                xray=False
-            )
-            # Si une méthode d'export existe, l'appeler ici
-            if hasattr(pdf_interactive, 'save_results'):
-                pdf_interactive.save_results(outputfile)
-            pdf_interactive.show()
-            # Store the interactive object for access to results
-            self.pdf_interactive = pdf_interactive
-            # Return a reference to the results that will be updated by sliders
-            return PDFResultsReference(pdf_interactive)
-        else:
-            print('Compute PDF with given parameters')
-            r,G = compute_ePDF(
-                q_sample,
-                intensity_sample,
-                composition,
-                Iref=intensity_ref if ref_data is not None else None,
-                bgscale=bgscale,
-                qmin=qmin,
-                qmax=qmax,
-                qmaxinst=qmaxinst,
-                rmin=rmin,
-                rmax=rmax,
-                rstep=rstep,
-                rpoly=rpoly,
-                Lorch=True,
-                plot=plot)
-            # header should have same architecture as .gr files from pdfgetx3 for compatibility with PDFBatchAnalysis
-            header  = '[DEFAULT]\n\nversion = ePDFsuite 1.0\n\n'
-            header += '#input and output specifications\n'
-            header += 'dataformat = q_A \n'
-            header +=f'inputfile = {sample_diffraction_image}\n'
-            header +=f'backgroundfile = {ref_diffraction_image}\n'
-            header += 'outputtype = gr\n\n'
-            header += '#PDF calculation setup\n'
-            header += 'mode = electrons\n'        
-            header +=f'wavelength = {self.metadata.get("wavelength", "unknown"):.4f}\n'
-            header += 'twothetazero = 0\n'        
-            header +=f'composition={composition} \n'
-            header +=f'bgscale = {1:.2f} \n'
-            header +=f'rpoly = {1.4} \n'
-            header +=f'qmaxinst = {np.max(q_sample):.2f}\n'
-            header +=f'qmin = {np.min(q_sample):.2f} \n'
-            header +=f'qmax = {np.max(q_sample):.2f}  \n'
-            header +=f'rmin = {0:.2f} \n'
-            header +=f'rmax = {50:.2f} \n'
-            header +=f'rstep = {0.01:.2f}\n\n'
-            header += '# End of config --------------------------------------------------------------\n#### start data\n\n'
-            header += '#S 1 \n'
-            header += '#L r(Å)  G(Å$^{-2}$)'
-
-            np.savetxt(outputfile, np.column_stack((r, G)),header=header,delimiter=' ',comments='')
-            print(f'PDF saved to {outputfile}')
-            return r, G
+        return extract_epdf(
+            sample_processor=self,
+            ref_processor=ref_processor,
+            composition=composition,
+            rmin=rmin,
+            rmax=rmax,
+            rstep=rstep,
+            outputfile=outputfile,
+            interactive=interactive,
+            plot=plot,
+            bgscale=bgscale,
+            qmin=qmin,
+            qmax=qmax,
+            qmaxinst=qmaxinst,
+            rpoly=rpoly,
+        )
 
 
 
@@ -447,49 +454,57 @@ def extract_epdf(sample_processor,
                  qmaxinst=24,
                  rpoly=1.4):
     """
-    Extract electron pair distribution function (ePDF) from SAED data.
-    
-    This standalone function provides a clean interface for ePDF extraction,
-    treating sample and reference data symmetrically via SAEDProcessor instances.
-    
+    Extract the electron Pair Distribution Function (ePDF) from SAED data.
+
+    Integrates each :class:`SAEDProcessor` to a 1D I(q) profile, then calls
+    :func:`~epdfsuite.pdf_extraction.compute_ePDF`. In interactive mode an
+    ipywidgets GUI is shown; in non-interactive mode G(r) is computed once
+    and saved to a ``.gr`` file.
+
     Parameters
     ----------
     sample_processor : SAEDProcessor
-        Processor for sample diffraction data. Should have initial_center set if needed.
+        Processor loaded with the sample diffraction image.
+        Set ``sample_processor.initial_center`` before calling if needed.
     ref_processor : SAEDProcessor, optional
-        Processor for reference/background diffraction data. If None, no background subtraction.
-    composition : str
-        Chemical composition (e.g., 'Au', 'Fe2O3')
-    rmin, rmax, rstep : float
-        PDF r-range parameters (Angstroms)
+        Processor loaded with the background/reference image.
+        If ``None``, no background subtraction is performed.
+    composition : str, optional
+        Chemical formula of the sample (e.g. ``'Au'``, ``'Fe2O3'``).
+        Default is ``'Au'``.
+    rmin, rmax, rstep : float, optional
+        Real-space range and step for G(r) in Å.
+        Defaults: 0.1, 50.0, 0.01.
     outputfile : str, optional
-        Path to save PDF results. Auto-generated if None.
-    interactive : bool
-        If True, shows interactive parameter adjustment GUI
-    plot : bool
-        If True, plots results in non-interactive mode
-    bgscale, qmin, qmax, qmaxinst, rpoly : float
-        PDF computation parameters
-    
+        Path for the output ``.gr`` file.
+        Auto-generated from the sample filename if ``None``.
+    interactive : bool, optional
+        If ``True`` (default), open the interactive slider GUI via
+        :class:`PDFInteractive`.
+    plot : bool, optional
+        If ``True``, display G(r) and F(Q) in non-interactive mode.
+    bgscale : float, optional
+        Background scaling factor applied to the reference. Default is 1.
+    qmin, qmax, qmaxinst : float, optional
+        Q-range limits in Å⁻¹ used for the Fourier transform and polynomial
+        background fitting.
+    rpoly : float, optional
+        Polynomial degree control (PDFgetX3 convention). Default is 1.4.
+
     Returns
     -------
     results : PDFResultsReference or tuple
-        Interactive mode: PDFResultsReference with .r and .g properties
-        Non-interactive mode: tuple (r, G)
-    
+        Interactive mode: :class:`PDFResultsReference` — supports
+        ``r, g = results`` unpacking after slider adjustment.
+        Non-interactive mode: ``(r, G)`` tuple of ndarrays.
+
     Examples
     --------
-    >>> # Setup processors
     >>> sample = SAEDProcessor('sample.dm4', poni_file='calib.poni')
-    >>> sample.plot()  # Inspect to determine center
-    >>> sample.initial_center = (335, 275)  # Set after inspection
-    >>> 
-    >>> ref = SAEDProcessor('reference.dm4', poni_file='calib.poni')
-    >>> ref.initial_center = (324, 257)
-    >>> 
-    >>> # Extract PDF
-    >>> results = extract_epdf(sample, ref, composition='Au', interactive=True)
-    >>> r, g = results  # Access results
+    >>> sample.initial_center = (335, 275)
+    >>> ref = SAEDProcessor('ref.dm4', poni_file='calib.poni')
+    >>> results = extract_epdf(sample, ref, composition='Au', interactive=False)
+    >>> r, G = results
     """
     # Integrate sample
     q_sample, intensity_sample = sample_processor.integrate(plot=False)
@@ -583,31 +598,29 @@ def extract_epdf(sample_processor,
 # ------------------
 class PDFResultsReference:
     """
-    A reference object that allows unpacking of PDF results from interactive mode.
-    
-    This class acts as a wrapper around PDFInteractive, providing access to the
-    most recently computed r and G values through tuple unpacking.
-    
-    Usage:
-        r, g = proc.extract_epdf(interactive=True)
-        # After adjusting sliders, r and g will contain the latest values
-        print(r, g)  # Access the arrays directly
+    Proxy object providing access to the most recent PDF results from interactive mode.
+
+    Wraps a :class:`PDFInteractive` instance and supports tuple unpacking
+    (``r, g = reference``) so that the same syntax works whether the
+    extraction is interactive or not. Values reflect the **last slider
+    state** — call ``r, g = results`` after adjusting the sliders.
     """
     
     def __init__(self, pdf_interactive):
         """
-        Initialize with a PDFInteractive instance.
-        
-        Args:
-            pdf_interactive: The PDFInteractive object containing the results
+        Parameters
+        ----------
+        pdf_interactive : PDFInteractive
+            The interactive GUI object holding the computed results.
         """
         self._pdf_interactive = pdf_interactive
     
     def __iter__(self):
         """
-        Allow tuple unpacking: r, g = reference
-        
-        Returns the latest computed r and G arrays.
+        Support tuple unpacking: ``r, g = reference``.
+
+        Returns the latest r and G arrays computed by the interactive GUI.
+        Prints a warning if no computation has been performed yet.
         """
         if self._pdf_interactive.last_r is None or self._pdf_interactive.last_G is None:
             print("⚠️ Aucune valeur disponible. Ajustez les paramètres avec les sliders pour générer r et G.")
@@ -615,7 +628,7 @@ class PDFResultsReference:
         return iter([self._pdf_interactive.last_r, self._pdf_interactive.last_G])
     
     def __repr__(self):
-        """String representation of the reference."""
+        """String representation showing r-range and number of points."""
         if self._pdf_interactive.last_r is None:
             return "PDFResultsReference(no data yet - adjust sliders to compute)"
         return f"PDFResultsReference(r: {len(self._pdf_interactive.last_r)} points, " \
@@ -623,12 +636,12 @@ class PDFResultsReference:
     
     @property
     def r(self):
-        """Direct access to r array."""
+        """ndarray : Real-space distance axis in Å from the last computation."""
         return self._pdf_interactive.last_r
     
     @property
     def g(self):
-        """Direct access to G array."""
+        """ndarray : G(r) values in Å⁻² from the last computation."""
         return self._pdf_interactive.last_G
 
 
@@ -637,9 +650,13 @@ class PDFResultsReference:
 # ------------------
 class PDFInteractive:
     """
-    Interactive widget-based interface for PDF parameter optimization.
-    
-    
+    Jupyter widget GUI for interactive ePDF parameter optimisation.
+
+    Displays ipywidgets sliders for ``bgscale``, ``qmin``, ``qmax``,
+    ``qmaxinst``, and ``rpoly``, recomputing G(r) in real time.
+    Results can be exported to a ``.gr`` file via the Save button.
+
+    Intended to be created by :func:`extract_epdf` — not directly by users.
     """
 
     def __init__(self,
@@ -652,14 +669,21 @@ class PDFInteractive:
                  xray: bool = False,
                  outputfile: str = './pdf_results.csv'):
         """
-        Initialise l'interface interactive PDF à partir de deux SAEDProcessor.
-        Args:
-            sample_processor (SAEDProcessor): instance pour le signal
-            ref_processor (SAEDProcessor, optionnel): instance pour le fond
-            composition (str): formule chimique
-            rmin, rmax, rstep (float): paramètres PDF
-            xray (bool): X-ray scattering factors
-            outputfile (str): nom du fichier de sortie
+        Parameters
+        ----------
+        sample_processor : SAEDProcessor
+            Processor for the sample diffraction data.
+        ref_processor : SAEDProcessor, optional
+            Processor for the background/reference image. Default is ``None``.
+        composition : str, optional
+            Chemical formula of the sample. Default is ``'Au'``.
+        rmin, rmax, rstep : float, optional
+            Real-space range and step for G(r) in Å.
+        xray : bool, optional
+            If ``True``, use X-ray scattering factors. Default is ``False``.
+        outputfile : str, optional
+            Default path for the Save button output. Default is
+            ``'./pdf_results.csv'``.
         """
         import ipywidgets as widgets
         from IPython.display import display
@@ -752,9 +776,22 @@ class PDFInteractive:
 
     def update_plot(self, bgscale, qmin, qmax, qmaxinst, rpoly, lorch):
         """
-        Update the PDF calculation and plots when parameters change.
-        
-        This function is called automatically when any slider value changes.
+        Recompute G(r) and refresh the output plot.
+
+        Called automatically by ``ipywidgets.interactive_output`` whenever
+        a slider value changes. Stores the result in ``self.last_r`` and
+        ``self.last_G``.
+
+        Parameters
+        ----------
+        bgscale : float
+            Background scaling factor.
+        qmin, qmax, qmaxinst : float
+            Q-range limits in Å⁻¹.
+        rpoly : float
+            Polynomial degree control parameter.
+        lorch : bool
+            Whether to apply the Lorch modification function.
         """
         with self.plot_output:
             self.plot_output.clear_output(wait=True)
@@ -768,11 +805,17 @@ class PDFInteractive:
 
     def save_results(self, b, outputfile='./pdf_results.gr'):
         """
-        Save the last computed PDF results to TXT file with metadata.
-        
-        Args:
-            b: Button widget (unused, required by widget callback signature)
-            outputfile: Output filename (default: './pdf_results.gr')
+        Save the last computed G(r) to a ``.gr`` text file.
+
+        The file format is compatible with PDFgetX3 / PDFBatchAnalysis,
+        with a structured header containing all computation parameters.
+
+        Parameters
+        ----------
+        b : widget button event
+            Unused; required by the ipywidgets callback signature.
+        outputfile : str, optional
+            Output file path. Default is ``'./pdf_results.gr'``.
         """
         if self.last_r is None or self.last_G is None:
             print("⚠️ Aucun résultat à sauvegarder (génère d'abord un plot).")
@@ -809,9 +852,11 @@ class PDFInteractive:
 
     def show(self):
         """
-        Display the interactive interface.
-        
-        Creates a horizontal layout with sliders on the left and plots on the right.
+        Render and display the interactive GUI in a Jupyter notebook.
+
+        Computes G(r) with the current slider values before displaying
+        the interface, so that ``last_r`` and ``last_G`` are immediately
+        available for tuple unpacking.
         """
         # Generate initial plot with default parameter values BEFORE displaying UI
         # This ensures last_r and last_G are immediately available for unpacking
@@ -844,21 +889,42 @@ def extract_ePDF_from_mutliple_files(dm4_files,
                                      plot=False,
                                      verbose=False):
         """
-        Docstring pour extract_ePDF_from_mutliple_files
-        
-        
-        :param dm4_files: list of file paths to SAED data files in DM4, DM3, tif, tiff format
-        :param ref_diffraction_image: file path to reference diffraction image
-        :param ref_poni_file: file path to PONI file for reference (if different resolution from sample)
-        :param composition: chemical composition of the sample
-        :param rmin: minimum r value for PDF calculation
-        :param rmax: maximum r value for PDF calculation
-        :param rstep: step size for r values in PDF calculation
-        :param outputfile: file path to save the output PDF data
-        :param interactive: whether to run in interactive mode
-        :param poni_file: file path to PONI file for calibration
-        :param beamstop: whether to apply beamstop correction
-        :param verbose: whether to print detailed information during processing
+        Extract ePDF by averaging over multiple SAED image files.
+
+        Integrates each file independently, interpolates all profiles onto
+        the q-grid of the first file, computes an average I(q), and calls
+        :func:`~epdfsuite.pdf_extraction.compute_ePDF`.
+
+        Parameters
+        ----------
+        dm4_files : list of str
+            Paths to the SAED image files (DM4, DM3, tif, tiff).
+        ref_diffraction_image : str, optional
+            Path to the background/reference diffraction image.
+        ref_poni_file : str, optional
+            Path to a PONI file for the reference if different from the sample.
+        composition : str, optional
+            Chemical formula of the sample. Default is ``'Au'``.
+        rmin, rmax, rstep : float, optional
+            Real-space range and step for G(r) in Å.
+        qmin, qmax, qmaxinst : float, optional
+            Q-range limits in Å⁻¹ for PDF computation.
+        bgscale : float, optional
+            Background scaling factor. Default is 1.0.
+        rpoly : float, optional
+            Polynomial degree control (PDFgetX3 convention). Default is 1.4.
+        outputfile : str, optional
+            Output ``.gr`` file path. Auto-generated if ``None``.
+        interactive : bool, optional
+            If ``True`` (default), open the interactive slider GUI.
+        poni_file : str, optional
+            Path to the pyFAI PONI calibration file.
+        beamstop : bool, optional
+            Reserved for future use. Default is ``False``.
+        plot : bool, optional
+            If ``True``, display plots in non-interactive mode.
+        verbose : bool, optional
+            If ``True``, print processing details. Default is ``False``.
         """
 
 
