@@ -2,7 +2,7 @@ import re
 import os
 import sys
 import hyperspy.api as hs
-from .camera_library import DETECTOR_LIBRARY
+from camera_library import DETECTOR_LIBRARY
 import numpy as np
 
 
