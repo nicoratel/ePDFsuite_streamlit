@@ -3,7 +3,7 @@ from scipy.optimize import curve_fit
 from scipy.special import erf
 import numpy as np
 from matplotlib import pyplot as plt
-from .filereader import load_data
+from filereader import load_data
 from scipy.ndimage import rotate, binary_erosion
 from skimage.transform import hough_line, hough_line_peaks
 from skimage.feature import canny
