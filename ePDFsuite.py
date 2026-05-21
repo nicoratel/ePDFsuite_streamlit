@@ -27,6 +27,7 @@ class SAEDProcessor:
                 # deconvolution parameters
                 mtf_file=None,
                 wiener_epsilon=None,
+                dqe_file=None,
                 verbose=False):
         """
         Initialise a SAED data processor.
@@ -51,6 +52,9 @@ class SAEDProcessor:
         wiener_epsilon : float, optional
             Regularisation parameter for the Wiener filter.
             If ``None``, read from column 3 of the MTF file.
+        dqe_file : str, optional
+            Path to the DQE file used for deconvolution.
+            If ``None``, Wiener deconvolution if MTF is available, else no deconvolution
         verbose : bool, optional
             If ``True``, print metadata and detector info. Default is ``False``.
         """
@@ -85,16 +89,16 @@ class SAEDProcessor:
         # load and apply MTF deconvolution (Wiener filter) if MTF file is provided
         if mtf_file is not None:
             self.ismtf = True
-            from utilities import deconvolve_mtf_2d
-            self.img = deconvolve_mtf_2d(self.img, mtf_file, wiener_epsilon=wiener_epsilon)
+            if dqe_file is None:
+                from .utilities import deconvolve_mtf_2d
+                self.img = deconvolve_mtf_2d(self.img, mtf_file, wiener_epsilon=wiener_epsilon)
+                self.isdqe = False
+            else:
+                from .utilities import deconvolve_mtf_dqe_2d
+                self.img = deconvolve_mtf_dqe_2d(self.img, mtf_file, dqe_file)
+                self.isdqe = True
         else:
             self.ismtf = False
-
-        # check binning
-        if self.metadata['image_height'] != self.img.shape[0] or self.metadata['image_width'] != self.img.shape[1]:
-            self.binning = self.metadata['image_height'] / self.img.shape[0]
-        else:
-            self.binning = 1
 
         # Determine beam centre automatically via iso-intensity contour method.
         # Fall back to the intensity-maximum if isocurve detection fails.
@@ -164,21 +168,56 @@ class SAEDProcessor:
             valid = ~mask_bool.ravel()
             y_idx, x_idx = np.indices(self.img.shape)
             r = np.sqrt((x_idx - cx)**2 + (y_idx - cy)**2)
-            r_int = r.astype(int).ravel()
+            r_flat = r.ravel()
             img_flat = self.img.ravel()
-            radial_bins = np.bincount(r_int[valid], weights=img_flat[valid],
-                                      minlength=r_int.max() + 1)
-            radial_counts = np.bincount(r_int[valid], minlength=r_int.max() + 1)
-            I = radial_bins / radial_counts
-            q = np.arange(len(I))
+
+            # Sub-pixel (linear-interpolation) binning: each pixel's weight is
+            # split between its two neighbouring bins proportionally to the
+            # fractional distance to each bin centre, mimicking the CSR/LUT
+            # approach used by pyFAI and eliminating bin-boundary artefacts.
+            r_max = r_flat[valid].max()
+            bin_width = r_max / npt
+            # Continuous bin index for every valid pixel
+            r_norm = r_flat[valid] / bin_width          # in [0, npt]
+            k = r_norm.astype(int)                      # lower bin
+            frac = r_norm - k                           # fractional part in [0, 1)
+            k  = np.clip(k,     0, npt - 1)
+            k1 = np.clip(k + 1, 0, npt - 1)
+            img_v = img_flat[valid]
+            weights_sum = np.zeros(npt)
+            counts      = np.zeros(npt)
+            np.add.at(weights_sum, k,  (1.0 - frac) * img_v)
+            np.add.at(weights_sum, k1, frac          * img_v)
+            np.add.at(counts,      k,  (1.0 - frac))
+            np.add.at(counts,      k1, frac)
+            with np.errstate(invalid='ignore', divide='ignore'):
+                I = np.where(counts > 0, weights_sum / counts, 0.0)
+            # Bin centres in pixel units (used for q conversion below)
+            edges = np.linspace(0.0, r_max, npt + 1)   # kept for r_centers
+
+            # Bin centres in pixels → convert to q using the hyperspy scale
+            r_centers = 0.5 * (edges[:-1] + edges[1:])
             if self.units == '1/nm':
-                q = q * self.scale * 2 * np.pi / 10
+                q = r_centers * self.scale * 2 * np.pi / 10
+                # Solid angle correction: derive 2θ from q and wavelength
+                # q = 4π sin(θ)/λ  →  sin(θ) = qλ/(4π)
+                wavelength_A = self.metadata.get('wavelength', None)
+                if wavelength_A is not None:
+                    sin_theta = np.clip(q * wavelength_A / (4 * np.pi), -1.0, 1.0)
+                    two_theta = 2 * np.arcsin(sin_theta)
+                    cos3 = np.where(np.cos(two_theta) > 0, np.cos(two_theta) ** 3, 1.0)
+                    I = I / cos3
             elif self.units == 'mrad':
-                theta = q * self.scale * 1e-3
+                # theta (Bragg half-angle) in radians; detector angle = 2θ
+                theta = (r_centers * self.scale * 1e-3) / 2
                 q = 4 * np.pi * np.sin(theta) / self.metadata['wavelength']
-                q /= self.binning
-            else:
-                q = q * self.scale * 2 * np.pi
+                
+                # Solid angle correction using detector angle 2θ
+                two_theta = 2 * theta
+                cos3 = np.where(np.cos(two_theta) > 0, np.cos(two_theta) ** 3, 1.0)
+                I = I / cos3
+            else: # assume units are already in s (1/Å)
+                q = r_centers * self.scale * 2 * np.pi
                 
 
         
@@ -230,10 +269,11 @@ class SAEDProcessor:
             ``level_range``, ``rms_rel_max``, ``min_arc_deg``,
             ``cluster_window``).
         """
-        recalibrate_from_isocurve(
+        c_x,c_y = recalibrate_from_isocurve(
             self.img, mask=_mask_as_array(self.mask), plot=True,
             initial_center=self.center, **kwargs
         )
+        self.center = (c_x, c_y)
 
     def inspect_histogram(self, bins=256, log_scale=True, exclude_zero=False,
                           saturation_threshold=0.98, percentile_clip=99.9999):
