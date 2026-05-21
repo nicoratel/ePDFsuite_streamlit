@@ -90,7 +90,7 @@ class SAEDProcessor:
         if mtf_file is not None:
             self.ismtf = True
             if dqe_file is None:
-                from .utilities import deconvolve_mtf_2d
+                from utilities import deconvolve_mtf_2d
                 self.img = deconvolve_mtf_2d(self.img, mtf_file, wiener_epsilon=wiener_epsilon)
                 self.isdqe = False
             else:
