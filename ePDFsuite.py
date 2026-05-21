@@ -94,7 +94,7 @@ class SAEDProcessor:
                 self.img = deconvolve_mtf_2d(self.img, mtf_file, wiener_epsilon=wiener_epsilon)
                 self.isdqe = False
             else:
-                from .utilities import deconvolve_mtf_dqe_2d
+                from utilities import deconvolve_mtf_dqe_2d
                 self.img = deconvolve_mtf_dqe_2d(self.img, mtf_file, dqe_file)
                 self.isdqe = True
         else:
