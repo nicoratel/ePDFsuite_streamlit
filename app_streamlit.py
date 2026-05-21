@@ -13,10 +13,10 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 
 # Import the necessary modules from your package
-from epdfsuite import SAEDProcessor, extract_epdf
-from epdfsuite.filereader import load_data
-from epdfsuite.utilities import draw_mask
-from epdfsuite.pdf_extraction import compute_ePDF
+from ePDFsuite import SAEDProcessor, extract_epdf
+from filereader import load_data
+from utilities import draw_mask
+from pdf_extraction import compute_ePDF
 import hyperspy.api as hs
 
 # Initialize session state variables
