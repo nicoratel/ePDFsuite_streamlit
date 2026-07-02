@@ -121,14 +121,8 @@ def compute_scattering_profile(elements, s_values, xray=False):
             # For X-rays: f(k) where k = s
             profiles[i] = x_ray_scattering_factor(s_values, params)
         else:
-            # For electrons: f(k^2) where k^2 = s^2
-            # This is vectorized now
-            k2_values = s_values**2
-            profiles[i] = electron_scattering_factor(k2_values, params)
-            # For electrons: use k^2 = s^2
-            k2_values = s_values**2
-            profiles[i] = np.array([electron_scattering_factor(k2, params) 
-                                   for k2 in k2_values])
+            # For electrons: f(k^2) where k^2 = s^2 — vectorized
+            profiles[i] = electron_scattering_factor(s_values**2, params)
     
     return profiles
 
