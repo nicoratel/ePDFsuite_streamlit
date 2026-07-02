@@ -333,13 +333,33 @@ def compute_ePDF(
     )
     f2avg = np.interp(q, q_f2, f2avg)
 
-    mask_inf = q > 0.9 * qmax
-    I_inf = np.mean(Iexp[mask_inf])
+    _, favg = compute_avg_scattering_factor(
+        composition,
+        x_max=qmax,
+        x_step=qstep,
+        qvalues=True,
+        xray=False,
+    )
+    favg = np.interp(q, q_f2, favg)
 
-    Inorm = Iexp / f2avg
+    # --- Robust high-Q affine normalization (from memory notes) ---
+    # S(Q)-1 = (alpha*I + beta - <f²>) / <f>²
+    # alpha estimated from cov/var on top-Q bins, guarded by robust ratio bounds
+    mask_hq = q > 0.9 * qmax
+    I_hq = Iexp[mask_hq]
+    f2_hq = f2avg[mask_hq]
+
+    alpha_raw = np.cov(I_hq, f2_hq)[0, 1] / (np.var(I_hq) + 1e-30)
+    ratio_med = np.median(f2_hq) / (np.median(I_hq) + 1e-30)
+    alpha = np.clip(alpha_raw, 0.5 * ratio_med, 2.0 * ratio_med)
+
+    # beta enforces mean S(Q)-1 ~ 0 at high-Q, clipped to 1% of mean |<f²>|
+    beta_raw = np.mean(f2_hq) - alpha * np.mean(I_hq)
+    beta_clip = 0.01 * np.mean(np.abs(f2avg))
+    beta = np.clip(beta_raw, -beta_clip, beta_clip)
 
     # --- Modified intensity F(Q) ---
-    Fm = q * (Inorm / I_inf - 1)
+    Fm = q * (alpha * Iexp + beta - f2avg) / favg**2
 
     # --- Polynomial background (PDFgetX3 philosophy) ---
     background = fit_polynomial_background(
@@ -354,7 +374,10 @@ def compute_ePDF(
     qv = q[mask]
 
     if Lorch:
-        Fv = Fc[mask] * np.sinc(qv / qmax)
+        # Partial RMS renormalization: divide by RMS^0.7 to reduce ON/OFF amplitude bias
+        lorch_win = np.sinc(qv / qmax)
+        lorch_rms = np.sqrt(np.mean(lorch_win**2))
+        Fv = Fc[mask] * lorch_win / (lorch_rms ** 0.7)
     else:
         Fv = Fc[mask]
 
