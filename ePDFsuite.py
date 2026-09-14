@@ -1,6 +1,6 @@
-from .filereader import load_data
-from .recalibration import recalibrate_from_isocurve, center_calc_ediff
-from .pdf_extraction import compute_ePDF
+from filereader import load_data
+from recalibration import recalibrate_from_isocurve, center_calc_ediff
+from pdf_extraction import compute_ePDF
 from pyFAI import load
 import fabio
 from matplotlib import pyplot as plt
