@@ -70,7 +70,7 @@ st.markdown("""
 # Add stop button in sidebar
 st.sidebar.markdown("---")
 if st.sidebar.button("🛑 Stop App", type="secondary"):
-    st.success("👋 Thanks for using ePDFsuite! Session ended.")
+    st.success(" Thanks for using ePDFsuite! Session ended.")
     st.stop()
 
 # Create two tabs (Define Sample/Ref first, then PDF Extraction)
@@ -135,6 +135,14 @@ with tab1:
         sample_dqe = st.file_uploader(
             "DQE file (optional)",
             key="sample_dqe",
+        )
+
+        _s_precession_angle = st.number_input(
+            "Precession angle (°, optional)",
+            value=None,
+            min_value=0.0,
+            format="%.3f",
+            key="sample_precession_angle",
         )
 
         # MTF deconvolution parameters
@@ -213,6 +221,7 @@ with tab1:
                         dqe_file=st.session_state.get("sample_dqe_path"),
                         wiener_epsilon=_s_mtf_eps,
                         verbose=False,
+                        precession_angle=_s_precession_angle,
                     )
                     st.session_state.sample_processor = _proc
                     st.session_state.sample_cx = int(round(_proc.center[0]))
@@ -334,6 +343,16 @@ with tab1:
         if ref_dqe is None and sample_dqe is not None:
             st.caption(f"ℹ️ Will use sample DQE: {sample_dqe.name}")
 
+        _r_precession_angle = st.number_input(
+            "Precession angle (°, optional, defaults to sample)",
+            value=None,
+            min_value=0.0,
+            format="%.3f",
+            key="ref_precession_angle",
+        )
+        if _r_precession_angle is None:
+            _r_precession_angle = _s_precession_angle
+
         # MTF deconvolution parameters
         if ref_mtf is not None:
             # When the file changes, read epsilon from column 3 of the MTF file
@@ -411,6 +430,8 @@ with tab1:
                         dqe_file=st.session_state.get("ref_dqe_path"),
                         wiener_epsilon=_r_mtf_eps,
                         verbose=False,
+                        precession_angle=_r_precession_angle,
+                        amorphous=True,
                     )
                     st.session_state.ref_processor = _proc
                     st.session_state.ref_cx = int(round(_proc.center[0]))
@@ -543,6 +564,9 @@ with tab2:
                 int(st.session_state.get("sample_cy", round(_s_proc.center[1]))),
             )
             q_sample, I_sample = _s_proc.integrate(plot=False)
+            # If a precession angle was set, SAEDProcessor.integrate() computes
+            # qmax_prec (the max reliable q given the precession geometry).
+            st.session_state.qmax_prec = getattr(_s_proc, "qmax_prec", None)
 
             status_text.text("⏳ Integrating reference...")
             progress_bar.progress(50)
@@ -593,11 +617,26 @@ with tab2:
             st.markdown("### 🎚️ Parameters")
             bgscale_int = st.slider("bgscale", 0.0, 2.5, _default_bgscale, 0.01, key="bgscale_slider")
             qmin_int = st.slider("qmin (Å⁻¹)", 0.1, q_max_data, _default_qmin, 0.1, key="qmin_slider")
-            qmax_int = st.slider("qmax (Å⁻¹)", float(np.min(st.session_state.q_data)), q_max_data, _default_qmax, 0.1, key="qmax_slider")
+
+            # Cap qmax to qmax_prec (precession-limited q range) when a
+            # precession angle was provided for the sample. The upper bound
+            # of the slider itself is reduced so its displayed value always
+            # reflects the cap (instead of just clamping it after reading).
+            qmax_prec = st.session_state.get("qmax_prec")
+            qmax_upper = min(float(qmax_prec), q_max_data) if qmax_prec is not None else q_max_data
+            # If a previous run stored a value above the new upper bound,
+            # clamp it first so Streamlit doesn't raise a range error.
+            if st.session_state.get("qmax_slider", 0.0) > qmax_upper:
+                st.session_state["qmax_slider"] = qmax_upper
+            qmax_int = st.slider("qmax (Å⁻¹)", float(np.min(st.session_state.q_data)), qmax_upper,
+                                  min(_default_qmax, qmax_upper), 0.1, key="qmax_slider")
+            if qmax_prec is not None and qmax_prec < q_max_data:
+                st.caption(f"ℹ️ qmax capped at {qmax_prec:.2f} Å⁻¹ (imposed by precession intensity corrections)")
+
             qmaxinst_int = st.slider("qmaxinst (Å⁻¹)", float(np.min(st.session_state.q_data)), q_max_data, _default_qmaxinst, 0.1, key="qmaxinst_slider")
             rpoly_int = st.slider("rpoly", 0.1, 10.0, _default_rpoly, 0.1, key="rpoly_slider")
             lorch_int = st.checkbox("Lorch window correction", value=_default_lorch, key="lorch_checkbox")
-            
+
             st.markdown("---")
             st.markdown("### 📥 Download")
         
